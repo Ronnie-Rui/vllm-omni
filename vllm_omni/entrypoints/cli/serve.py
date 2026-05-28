@@ -246,6 +246,15 @@ class OmniServeCommand(CLISubcommand):
             help="Override the deploy YAML's ``async_chunk:`` bool. Unset leaves the YAML value in force.",
         )
         omni_config_group.add_argument(
+            "--async-chunk-timeout-s",
+            type=float,
+            default=None,
+            help=(
+                "Fail a downstream async-chunk request after this many seconds waiting for an upstream chunk. "
+                "Unset preserves the default no-timeout behavior."
+            ),
+        )
+        omni_config_group.add_argument(
             "--stage-id",
             type=int,
             default=None,

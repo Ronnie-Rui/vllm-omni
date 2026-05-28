@@ -6,8 +6,9 @@ from typing import Any
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.metrics.stats import SchedulerStats
-from vllm.v1.request import RequestStatus
+from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 
 from vllm_omni.core.sched.output import OmniChunkRecvHandle, OmniSchedulerOutput
 
@@ -156,3 +157,62 @@ class OmniSchedulerMixin:
             return None
         self._last_stats_time = now
         return super().make_stats(*args, **kwargs)
+
+    def _get_async_chunk_timeout_s(self) -> float:
+        model_config = self.vllm_config.model_config
+        timeout_s = getattr(model_config, "async_chunk_timeout_s", None)
+        if timeout_s is None:
+            return 0.0
+        return float(timeout_s)
+
+    def _finish_timed_out_chunk_requests(self, timed_out_ids: set[str]) -> None:
+        """Fail requests that waited too long for upstream async chunks."""
+        if not timed_out_ids:
+            return
+
+        timed_out_requests: list[Request] = [
+            request for req_id in sorted(timed_out_ids) if (request := self.requests.get(req_id)) is not None
+        ]
+        if not timed_out_requests:
+            return
+
+        timed_out_id_set = {request.request_id for request in timed_out_requests}
+        try:
+            self.waiting.remove_requests(timed_out_requests)
+        except Exception:
+            self.waiting.remove_requests(timed_out_id_set)
+
+        timed_out_object_ids = {id(request) for request in timed_out_requests}
+        self.running = [request for request in self.running if id(request) not in timed_out_object_ids]
+
+        self.finish_requests(timed_out_id_set, RequestStatus.FINISHED_ERROR)
+
+        chunk_transfer_adapter: Any = getattr(self, "chunk_transfer_adapter", None)
+        if chunk_transfer_adapter is not None:
+            for request in timed_out_requests:
+                chunk_transfer_adapter.cleanup_receiver(request.request_id)
+
+    def _replace_session_with_streaming_update(
+        self,
+        session: Request,
+        update: StreamingUpdate,
+    ) -> None:
+        """For streaming input: Replace an existing streaming session payload with the latest update."""
+        session._output_token_ids.clear()
+        session._all_token_ids.clear()
+        new_prompt = update.prompt_token_ids or ()
+        session._all_token_ids.extend(new_prompt)
+        session.num_computed_tokens = 0
+        session.prompt_token_ids = update.prompt_token_ids or ()
+        session.additional_information = update.additional_information or None
+        # Update block hashes for the new tokens.
+        session.update_block_hashes()
+        session.num_prompt_tokens = len(session.prompt_token_ids)
+        session.arrival_time = update.arrival_time
+        session.sampling_params = update.sampling_params
+        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+            self.num_waiting_for_streaming_input -= 1
+        session.status = RequestStatus.WAITING
+
+        if self.log_stats:
+            session.record_event(EngineCoreEventType.QUEUED)

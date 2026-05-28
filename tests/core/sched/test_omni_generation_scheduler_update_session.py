@@ -9,6 +9,7 @@ update payloads early.
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +21,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 
 # isort: on
 
@@ -142,3 +144,75 @@ class TestReplaceSessionWithStreamingUpdate:
 
         assert session.events
         assert session.events[-1].type == EngineCoreEventType.QUEUED
+
+
+class _DummyWaitingQueue(list):
+    def remove_requests(self, requests):
+        request_ids = {r if isinstance(r, str) else r.request_id for r in requests}
+        self[:] = [r for r in self if r.request_id not in request_ids]
+
+
+class _DummyChunkTransferAdapter:
+    def __init__(self):
+        self.cleanup_receiver_calls = []
+
+    def cleanup_receiver(self, request_id):
+        self.cleanup_receiver_calls.append(request_id)
+
+
+class _TimeoutSchedulerStub(OmniSchedulerMixin):
+    def __init__(self):
+        self.vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(async_chunk_timeout_s=7.5),
+        )
+        self.waiting = _DummyWaitingQueue()
+        self.running = []
+        self.requests = {}
+        self.chunk_transfer_adapter = _DummyChunkTransferAdapter()
+        self.finished = []
+
+    def finish_requests(self, request_ids, finished_status):
+        self.finished.append((set(request_ids), finished_status))
+
+
+def _timeout_request(req_id, external_req_id=None):
+    return SimpleNamespace(request_id=req_id, external_req_id=external_req_id or req_id)
+
+
+def test_get_async_chunk_timeout_s_reads_model_config():
+    scheduler = _TimeoutSchedulerStub()
+
+    assert scheduler._get_async_chunk_timeout_s() == 7.5
+
+
+def test_get_async_chunk_timeout_s_defaults_to_disabled():
+    scheduler = _TimeoutSchedulerStub()
+    scheduler.vllm_config.model_config.async_chunk_timeout_s = None
+
+    assert scheduler._get_async_chunk_timeout_s() == 0.0
+
+
+def test_finish_timed_out_chunk_requests_removes_and_cleans_up():
+    scheduler = _TimeoutSchedulerStub()
+    waiting_req = _timeout_request("waiting", "ext-waiting")
+    running_req = _timeout_request("running", "ext-running")
+    survivor = _timeout_request("survivor")
+    scheduler.waiting.extend([waiting_req, survivor])
+    scheduler.running.extend([running_req, survivor])
+    scheduler.requests = {
+        "waiting": waiting_req,
+        "running": running_req,
+        "survivor": survivor,
+    }
+
+    scheduler._finish_timed_out_chunk_requests({"waiting", "running"})
+
+    assert scheduler.waiting == [survivor]
+    assert scheduler.running == [survivor]
+    assert scheduler.finished == [
+        ({"waiting", "running"}, RequestStatus.FINISHED_ERROR),
+    ]
+    assert scheduler.chunk_transfer_adapter.cleanup_receiver_calls == [
+        "running",
+        "waiting",
+    ]

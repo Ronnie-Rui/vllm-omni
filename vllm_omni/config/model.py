@@ -91,6 +91,9 @@ class OmniModelConfig(ModelConfig):
          hf_text_config: The sub text_config of the model's hf_config (default: None)
          stage_id: Identifier for the stage in a multi-stage pipeline (default: 0)
          async_chunk: If set to True, perform async chunk
+         async_chunk_timeout_s: Optional max seconds a downstream stage waits
+             for an async chunk before failing the request. Unset disables
+             timeout handling and preserves the previous behavior.
          model_stage: Stage type identifier, e.g., "thinker" or "talker"
              (default: "thinker")
          model_arch: Model architecture name
@@ -121,6 +124,7 @@ class OmniModelConfig(ModelConfig):
     async_chunk: bool = False
     # Stage-1 active stream slots; 0 keeps legacy chunk-level round-robin.
     active_stream_window: int = 0
+    async_chunk_timeout_s: float | None = None
     model_stage: str = "thinker"
     model_arch: str | None = None
     worker_type: str | None = None

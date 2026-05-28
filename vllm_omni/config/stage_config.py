@@ -515,6 +515,7 @@ class DeployConfig:
     async_chunk: bool = True
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
     active_stream_window: int = 0
+    async_chunk_timeout_s: float | None = None
     connectors: dict[str, Any] | None = None
     edges: list[dict[str, Any]] | None = None
     stages: list[StageDeployConfig] = field(default_factory=list)
@@ -693,6 +694,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     kwargs: dict[str, Any] = {
         "async_chunk": raw_dict.get("async_chunk", True),
         "active_stream_window": int(raw_dict.get("active_stream_window", 0) or 0),
+        "async_chunk_timeout_s": raw_dict.get("async_chunk_timeout_s", None),
         "connectors": raw_dict.get("connectors", None),
         "edges": raw_dict.get("edges", None),
         "stages": stages,
@@ -834,6 +836,7 @@ _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
     "pipeline_parallel_size",
     "active_stream_window",
     "custom_voice_dir",
+    "async_chunk_timeout_s",
 )
 
 
@@ -1238,8 +1241,11 @@ class StageConfigFactory:
         resolved_async_chunk = cli_overrides.get("async_chunk")
         if resolved_async_chunk is None:
             resolved_async_chunk = bool(pipeline.async_chunk)
+        resolved_async_chunk_timeout_s = cli_overrides.get("async_chunk_timeout_s")
         for stage in pipeline.stages:
             stage.yaml_engine_args["async_chunk"] = bool(resolved_async_chunk)
+            if resolved_async_chunk_timeout_s is not None:
+                stage.yaml_engine_args["async_chunk_timeout_s"] = float(resolved_async_chunk_timeout_s)
 
         # Apply CLI overrides
         result: list[StageConfig] = []
@@ -1294,6 +1300,9 @@ class StageConfigFactory:
         cli_async_chunk = cli_overrides.get("async_chunk")
         if cli_async_chunk is not None:
             deploy_cfg.async_chunk = bool(cli_async_chunk)
+        cli_async_chunk_timeout_s = cli_overrides.get("async_chunk_timeout_s")
+        if cli_async_chunk_timeout_s is not None:
+            deploy_cfg.async_chunk_timeout_s = float(cli_async_chunk_timeout_s)
 
         pipeline_key = deploy_cfg.pipeline or model_type
         if pipeline_key not in _PIPELINE_REGISTRY:

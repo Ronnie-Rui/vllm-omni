@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import time
 from collections import defaultdict, deque
 from collections.abc import Callable
 from typing import Any
@@ -88,6 +89,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._held_non_active: deque[Any] = deque()
         self.requests_num_chunks_sent: dict[str, int] = defaultdict(int)
         self._pending_streaming_prefills: dict[str, dict] = {}
+        self._waiting_for_chunk_since: dict[str, float] = {}
 
     @staticmethod
     def _is_truthy_scalar(value: Any) -> bool:
@@ -394,6 +396,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.requests_with_ready_chunks.discard(request_id)
         self.request_ids_mapping.pop(request_id, None)
         self.requests_origin_status.pop(request_id, None)
+        self._waiting_for_chunk_since.pop(request_id, None)
 
         self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)
@@ -547,10 +550,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 # Requests that waiting for chunk
                 self.load_async(request)
                 request.status = RequestStatus.WAITING_FOR_CHUNK
+                self._waiting_for_chunk_since.setdefault(request.request_id, time.monotonic())
             else:
                 if request.request_id in finished_load_reqs:
                     request.status = target_status
                     finished_load_reqs.remove(request.request_id)
+                    self._waiting_for_chunk_since.pop(request.request_id, None)
                     self.requests_with_ready_chunks.add(request.request_id)
                     continue
             queue.remove(request)
@@ -584,6 +589,46 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if self._held_non_active:
             running_queue.extend(self._held_non_active)
             self._held_non_active = deque()
+
+    def collect_timed_out_request_ids(self, timeout_s: float) -> set[str]:
+        """Return async-chunk requests that exceeded the chunk wait timeout.
+
+        ``process_pending_chunks()`` temporarily removes WAITING_FOR_CHUNK
+        requests from the scheduler queues, and ``restore_queues()`` puts them
+        back after the scheduling attempt.  A timeout check therefore cannot
+        rely only on queue membership.  The adapter records first-entry time
+        per request id and this method also prunes the adapter's temporary
+        deques so timed-out requests are not restored after the scheduler
+        marks them failed.
+        """
+        if timeout_s <= 0:
+            return set()
+
+        now = time.monotonic()
+        timed_out_ids = {
+            req_id for req_id, start_time in self._waiting_for_chunk_since.items() if now - start_time > timeout_s
+        }
+        if not timed_out_ids:
+            return set()
+
+        self.waiting_for_chunk_waiting_requests = deque(
+            req for req in self.waiting_for_chunk_waiting_requests if req.request_id not in timed_out_ids
+        )
+        self.waiting_for_chunk_running_requests = deque(
+            req for req in self.waiting_for_chunk_running_requests if req.request_id not in timed_out_ids
+        )
+
+        for req_id in timed_out_ids:
+            self._waiting_for_chunk_since.pop(req_id, None)
+            self._finished_load_reqs.discard(req_id)
+            self.requests_with_ready_chunks.discard(req_id)
+            logger.warning(
+                "Request %s timed out waiting for async chunk after %.0fs",
+                req_id,
+                timeout_s,
+            )
+
+        return timed_out_ids
 
     def postprocess_scheduler_output(
         self,
@@ -657,10 +702,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 # Requests that waiting for chunk
                 self.load_async(request)
                 request.status = RequestStatus.WAITING_FOR_CHUNK
+                self._waiting_for_chunk_since.setdefault(request.request_id, time.monotonic())
             else:
                 if request.request_id in finished_load_reqs:
                     request.status = target_status
                     finished_load_reqs.remove(request.request_id)
+                    self._waiting_for_chunk_since.pop(request.request_id, None)
                     self.requests_with_ready_chunks.add(request.request_id)
                     continue
             queue.remove(request)
@@ -712,5 +759,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self.finished_requests.discard(req_id)
             self._finished_load_reqs.discard(req_id)
             self._cancelled_load_reqs.add(req_id)
+            self._waiting_for_chunk_since.pop(req_id, None)
 
         return []

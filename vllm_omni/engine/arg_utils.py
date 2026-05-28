@@ -113,6 +113,9 @@ class OmniEngineArgs(EngineArgs):
             If None, default processing is used.
         stage_connector_spec: Extra configuration for stage connector
         async_chunk: If set to True, perform async chunk
+        async_chunk_timeout_s: Optional max seconds a downstream stage waits
+            for an async chunk before failing the request. Unset disables
+            timeout handling and preserves the previous behavior.
         worker_type: Model Type, e.g., "ar" or "generation"
         task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
             If not specified, will be inferred from model path.
@@ -146,6 +149,7 @@ class OmniEngineArgs(EngineArgs):
     # Must be declared here so engine_args dict propagation does not silently
     # drop the value when constructing OmniEngineArgs from kwargs.
     active_stream_window: int = 0
+    async_chunk_timeout_s: float | None = None
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
@@ -347,6 +351,7 @@ class OmniEngineArgs(EngineArgs):
             stage_id=self.stage_id,
             async_chunk=self.async_chunk,
             active_stream_window=self.active_stream_window,
+            async_chunk_timeout_s=self.async_chunk_timeout_s,
             model_stage=self.model_stage,
             model_arch=self.model_arch,
             worker_type=self.worker_type,

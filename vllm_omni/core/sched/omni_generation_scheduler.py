@@ -88,6 +88,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._process_pending_input_timeouts()
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
+            timed_out_ids = self.chunk_transfer_adapter.collect_timed_out_request_ids(self._get_async_chunk_timeout_s())
+            self._finish_timed_out_chunk_requests(timed_out_ids)
 
         # OMNI: Track requests that are already finished (e.g., marked by connector)
         # These should be removed from running and not scheduled

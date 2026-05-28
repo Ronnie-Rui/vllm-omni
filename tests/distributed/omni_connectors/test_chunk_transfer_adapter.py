@@ -470,6 +470,29 @@ def test_finished_releases_slot(build_adapter):
     assert req_2.status == RequestStatus.WAITING_FOR_CHUNK
 
 
+def test_collect_timed_out_request_ids_prunes_waiting_deques(build_adapter):
+    adapter, _ = build_adapter(stage_id=1, max_num_seqs=8)
+    waiting_req = _req("w-timeout", RequestStatus.WAITING)
+    running_req = _req("r-timeout", RequestStatus.RUNNING)
+    fresh_req = _req("fresh", RequestStatus.WAITING)
+    waiting_queue = DummyWaitingQueue([waiting_req, fresh_req])
+    running_queue = [running_req]
+
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+    adapter._waiting_for_chunk_since["w-timeout"] = 0.0
+    adapter._waiting_for_chunk_since["r-timeout"] = 0.0
+
+    timed_out = adapter.collect_timed_out_request_ids(timeout_s=1.0)
+
+    assert timed_out == {"w-timeout", "r-timeout"}
+    assert waiting_req not in adapter.waiting_for_chunk_waiting_requests
+    assert running_req not in adapter.waiting_for_chunk_running_requests
+    assert fresh_req in adapter.waiting_for_chunk_waiting_requests
+    assert "w-timeout" not in adapter._waiting_for_chunk_since
+    assert "r-timeout" not in adapter._waiting_for_chunk_since
+    assert "fresh" in adapter._waiting_for_chunk_since
+
+
 def test_postprocess_scheduler_output(build_adapter):
     adapter, _ = build_adapter()
     adapter.requests_with_ready_chunks = {"new-ready", "cached-ready", "leftover"}
