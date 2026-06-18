@@ -87,8 +87,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._consume_pending_connector_output(model_mode="generation")
         self._process_pending_input_timeouts()
         if self.chunk_transfer_adapter:
-            self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
-            timed_out_ids = self.chunk_transfer_adapter.collect_timed_out_request_ids(self._get_async_chunk_timeout_s())
+            self.chunk_transfer_adapter.process_pending_chunks(
+                self.waiting, self.running, scheduler_requests=self.requests
+            )
+            timed_out_ids = self.chunk_transfer_adapter.collect_timed_out_request_ids(
+                self._get_async_chunk_timeout_s()
+            )
             self._finish_timed_out_chunk_requests(timed_out_ids)
 
         # OMNI: Track requests that are already finished (e.g., marked by connector)
@@ -366,7 +370,23 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
 
+        # See ``OmniSchedulerMixin._realign_request_status_to_queues`` --
+        # closes the residual hang on the
+        # ``waiting → running → abort-before-next-deque-round-trip`` race
+        # surfaced by #3774's reproduction matrix. Only the
+        # ``async_chunk`` path actually triggers the staleness; with
+        # ``async_chunk`` disabled this is a cheap O(n) no-op, kept
+        # unconditional so the abort path stays uniform.
+        self._realign_request_status_to_queues(request_ids)
+
         finished = super().finish_requests(request_ids, finished_status)
+
+        # See ``OmniSchedulerMixin._purge_finished_from_running`` --
+        # defensive belt-and-suspenders sweep paired with the realign
+        # above. Closes residual ``self.running`` slot leaks if any
+        # corner case slips past upstream's status-driven removal.
+        self._purge_finished_from_running()
+
         if self.input_coordinator is not None:
             for request_id, _ in finished:
                 self._free_input_coordinator_request(request_id)
@@ -404,6 +424,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
+        mm_outputs = getattr(model_runner_output, "multimodal_outputs", None)
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
 
@@ -482,6 +503,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             new_token_ids = generated_token_ids
             kv_transfer_params = None
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
+            mm_output = mm_outputs[req_index] if mm_outputs else None
             status_before_stop = request.status
             finish_reason = None
             routed_experts = None
@@ -542,7 +564,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or pooler_output is not None or kv_transfer_params or stopped:
+            if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
+                # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     OmniEngineCoreOutput(
                         request_id=req_id,
@@ -551,6 +574,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
                         pooling_output=pooler_output,
+                        multimodal_output=mm_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
                         prefill_stats=request.take_prefill_stats(),
