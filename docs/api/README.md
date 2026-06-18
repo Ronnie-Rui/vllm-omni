@@ -92,7 +92,6 @@ Core scheduling and caching components.
 Configuration classes.
 
 - [vllm_omni.config.model.OmniModelConfig][]
-- [vllm_omni.config.stage_config.ModelPipeline][]
 - [vllm_omni.config.stage_config.StageConfig][]
 - [vllm_omni.config.stage_config.StageConfigFactory][]
 - [vllm_omni.config.stage_config.StageType][]
@@ -121,7 +120,6 @@ Configuration classes.
 - [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Qwen2_5_VLTextConfig][]
 - [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Qwen2_5_VLVisionConfig][]
 - [vllm_omni.transformers_utils.configs.omnivoice.OmniVoiceConfig][]
-- [vllm_omni.transformers_utils.configs.voxcpm.VoxCPMConfig][]
 - [vllm_omni.transformers_utils.configs.voxcpm2.VoxCPM2Config][]
 
 ## Workers

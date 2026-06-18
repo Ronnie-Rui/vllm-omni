@@ -5,6 +5,9 @@ vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation.
 - **Qwen3-TTS** (`Qwen/Qwen3-TTS-12Hz-*`) -- Qwen3-based TTS with CustomVoice, VoiceDesign, and Base (voice cloning) task types. Output: 24 kHz.
 - **Fish Speech S2 Pro** (`fishaudio/s2-pro`) -- Dual-AR TTS with DAC codec. Supports text-to-speech and voice cloning via reference audio. Output: 44.1 kHz.
 - **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
+- **CosyVoice3** (`FunAudioLLM/Fun-CosyVoice3-0.5B-2512`) -- 2-stage talker + flow-matching code2wav. Voice cloning via `ref_audio` + `ref_text` (no presets). Output: 24 kHz.
+
+See the [Supported Models](#supported-models) section below for the full list, including OmniVoice, VoxCPM2, and MOSS-TTS-Nano.
 
 Each server instance runs a single model (specified at startup via `vllm serve <model> --omni`).
 
@@ -26,6 +29,10 @@ vllm serve fishaudio/s2-pro --omni --port 8091
 
 # Voxtral TTS
 vllm serve mistralai/Voxtral-4B-TTS-2603 --omni --port 8091
+
+# CosyVoice3 (voice cloning only — supply ref_audio + ref_text per request)
+vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
+    --omni --port 8091 --trust-remote-code
 ```
 
 ### Generate Speech
@@ -107,9 +114,10 @@ Content-Type: application/json
 | `instructions` | string | "" | Voice style/emotion instructions |
 | `max_new_tokens` | integer | 2048 | Maximum tokens to generate |
 | `initial_codec_chunk_frames` | integer | null | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
+| `non_streaming_mode` | bool | null | Qwen3-TTS prompt construction mode override. Does not affect HTTP response streaming or async-chunk pipelining. When null, Qwen3-TTS uses model defaults: Base=false, CustomVoice/VoiceDesign=true. |
 | `stream` | bool | false | Stream raw PCM chunks as they are decoded (requires `response_format="pcm"`) |
 
-**Supported languages:** Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian
+**Supported languages:** Only applicable to Qwen3-TTS. Derived from the model configuration (`talker_config.codec_language_id` in the checkpoint's `config.json`), plus `Auto`, which is always accepted. Official Qwen3-TTS checkpoints support: Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian.
 
 #### Voice Clone Parameters (Base task)
 
@@ -325,7 +333,8 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "input": "Hello, this is a cloned voice",
         "task_type": "Base",
         "ref_audio": "https://example.com/reference.wav",
-        "ref_text": "Original transcript of the reference audio"
+        "ref_text": "Original transcript of the reference audio",
+        "non_streaming_mode": true
     }' --output cloned.wav
 ```
 
@@ -374,6 +383,44 @@ are cached in-process with a shared LRU so repeated requests with the same
 all TTS model types; deleting a voice invalidates every model-type slot at
 once.
 
+### Precomputed Custom Voices
+
+Qwen3-TTS Base and VoxCPM2 can load offline-precomputed voices at startup.
+Generate a directory containing `custom_voice_manifest.json` plus one
+`.safetensors` file per voice, then set the pipeline-wide deploy config field:
+
+```yaml
+custom_voice_dir: /path/to/custom_voices
+```
+
+Qwen3-TTS profiles are created with:
+
+```bash
+python examples/online_serving/text_to_speech/qwen3_tts/precompute_custom_voice.py \
+  --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --voice-name alice \
+  --ref-audio /path/to/reference.wav \
+  --ref-text "Original transcript of the reference audio" \
+  --mode icl \
+  --output-dir /path/to/custom_voices
+```
+
+VoxCPM2 profiles are created with:
+
+```bash
+python examples/online_serving/text_to_speech/voxcpm2/precompute_custom_voice.py \
+  --model openbmb/VoxCPM2 \
+  --voice-name alice \
+  --ref-audio /path/to/reference.wav \
+  --mode ref_continuation \
+  --prompt-text "Original transcript of the reference audio" \
+  --output-dir /path/to/custom_voices
+```
+
+Only profiles whose safetensors payload can be loaded and validated are exposed
+by `GET /v1/audio/voices`. Valid precomputed voices can be used in
+`POST /v1/audio/speech` by passing `voice="alice"` without `ref_audio`.
+
 **Configuration (environment variables):**
 
 | Variable | Default | Description |
@@ -409,6 +456,7 @@ Content-Type: application/json
 | `ref_audio` | string | null | Default reference audio (Base task) |
 | `ref_text` | string | null | Default reference transcript (Base task) |
 | `max_new_tokens` | integer | null | Default max tokens |
+| `non_streaming_mode` | bool | null | Default Qwen3-TTS prompt construction mode override. Does not affect HTTP response streaming or async-chunk pipelining. When null, Qwen3-TTS uses model defaults: Base=false, CustomVoice/VoiceDesign=true. |
 
 Each item in the `items` array requires only `input` (the text). All other fields are optional and override the batch-level defaults when set:
 
@@ -424,6 +472,7 @@ Each item in the `items` array requires only `input` (the text). All other field
 | `ref_audio` | string | Override reference audio |
 | `ref_text` | string | Override reference transcript |
 | `max_new_tokens` | integer | Override max tokens |
+| `non_streaming_mode` | bool | Override Qwen3-TTS prompt construction mode. Does not affect HTTP response streaming or async-chunk pipelining. When null, inherits the batch-level value (then the model default). |
 
 ### Response Format
 

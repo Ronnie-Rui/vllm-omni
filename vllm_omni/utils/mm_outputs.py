@@ -2,6 +2,8 @@
 payloads, most of which are shared by the prefix cache / no prefix cache path.
 """
 
+from collections.abc import Mapping
+
 import torch
 from vllm.logger import init_logger
 
@@ -23,7 +25,7 @@ def build_mm_cpu(multimodal_outputs: dict) -> dict[str, object]:
     mm_cpu: dict[str, object] = {}
     # Currently there are some cases where this is true at the
     # moment, which should be fixed.
-    if not isinstance(multimodal_outputs, dict):
+    if not isinstance(multimodal_outputs, Mapping):
         logger.warning("Multimodal outputs are not a dict and will not be passed")
 
     if multimodal_outputs:
@@ -68,12 +70,13 @@ def to_payload_element(
             if we need to avoid splitting nonempty lists prior to calling
             postprocess, which is the case for prefix cache.
         seq_len: Optional sequence length (i.e., dim 0 of hidden states).
-            This should be set to None in the prefix caching case, because
-            the condition that would be executed here is the same as the
-            criteria for being added to the multimodal outputs cache.
+            When set, a tensor whose first dimension equals seq_len is
+            sliced per request. The prefix cache passthrough also passes
+            the total scheduled token count here so 1D (seq_len,) metadata
+            that is intentionally not cached is still split per request.
     """
-    # Prefix cache won't hit this case because this is the condition
-    # for being a mm_cache_key in the multimodal outputs tensor.
+    # Cached per-token tensors are merged elsewhere; here a first dim
+    # equal to seq_len means a per-request slice is required.
     if seq_len is not None and isinstance(element, torch.Tensor) and element.shape[0] == seq_len:
         return element[start:end].contiguous()
     # Every other case is shared between prefix cache (passthrough data)
