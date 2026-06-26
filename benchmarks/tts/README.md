@@ -152,10 +152,8 @@ Outputs TTFP / RTF / throughput curves (and a markdown table) for every
 
 ### 5. Decode preprocess microbenchmark
 
-Times the host-side decode preprocess overhead without model weights or a
-serving stack — compares the runner's per-request scalar loop
-(`model.preprocess(...)` once per request) against `model.preprocess_decode_batch(...)`
-on synthetic decode states, with output parity checked by default:
+Compare scalar `preprocess(...)` with `preprocess_decode_batch(...)` on
+synthetic Qwen3-TTS decode states. Output parity is checked by default:
 
 ```bash
 python benchmarks/tts/bench_qwen3_tts_decode_preprocess.py \
@@ -164,18 +162,12 @@ python benchmarks/tts/bench_qwen3_tts_decode_preprocess.py \
     --output-json ./results/qwen3_tts_decode_preprocess.json
 ```
 
-This dependency-light benchmark uses a local PyTorch mirror of the Qwen3-TTS
-decode preprocess logic. It is an isolated operator-level measurement, not a
-reproduction of the full serving trace.
+This is a dependency-light operator benchmark, not a full serving trace.
 
 ### 6. Engine-level scalar-vs-batched A/B
 
-Run the real serving benchmark twice on the same GPU/model/dataset, toggling
-only the batched fast path via a server-side env var, then diff the result
-sets. The fast path is on by default for any stage implementing
-`preprocess_decode_batch`; set `VLLM_OMNI_DISABLE_BATCH_DECODE_PREPROCESS=1` on
-the **server** to force the scalar loop (the baseline). The bench client is
-unchanged.
+Run the same serving sweep twice, once with the fast path disabled on the
+server and once with the default batched path, then compare the result dirs:
 
 ```bash
 # A: scalar baseline (fast path disabled)

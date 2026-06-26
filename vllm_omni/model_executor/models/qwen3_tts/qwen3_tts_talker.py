@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -823,8 +823,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self,
         *,
         input_ids: torch.Tensor,
-        req_infos: list[dict[str, Any]],
-    ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]], dict[str, Any]]:
+        req_infos: list[dict[str, object]],
+    ) -> tuple[torch.Tensor, torch.Tensor, list[OmniPayload], dict[str, object]]:
         """Batch the decode-only preprocess path for Qwen3-TTS.
 
         Mirrors the scalar decode branch in ``preprocess()`` but does the token
@@ -846,17 +846,17 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         tts_pad_embed = self._tts_pad_embed.to(device=device, dtype=dtype).reshape(1, -1)
         past_hidden_list: list[torch.Tensor] = []
         text_step_list: list[torch.Tensor] = []
-        updates: list[dict[str, Any]] = []
+        updates: list[OmniPayload] = []
 
         for info_dict in req_infos:
             additional_information = info_dict.get("additional_information")
             if isinstance(additional_information, dict):
-                merged: dict[str, Any] = {k: v for k, v in info_dict.items() if k != "additional_information"}
+                merged: dict[str, object] = {k: v for k, v in info_dict.items() if k != "additional_information"}
                 for k, v in additional_information.items():
                     merged.setdefault(k, v)
                 info_dict = merged
 
-            payload: OmniPayload = info_dict
+            payload = cast(OmniPayload, info_dict)
             hs = payload.get("hidden_states", {})
             meta = payload.get("meta", {})
 
@@ -906,7 +906,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             past_hidden_list.append(last_hidden.to(device=device, dtype=dtype).reshape(1, -1))
             text_step_list.append(text_step)
 
-            info_update: dict[str, Any] = {
+            info_update: OmniPayload = {
                 "meta": {
                     "talker_text_offset": int(next_text_offset),
                     "codec_streaming": codec_streaming,

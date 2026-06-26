@@ -38,11 +38,6 @@ def _make_minimal_talker(
     if tts_pad_embed is None:
         tts_pad_embed = torch.zeros((1, 4), dtype=torch.bfloat16)
     model._tts_pad_embed = tts_pad_embed
-    # ``__init__`` is skipped above, so set the embedding dtype the preprocess /
-    # decode paths read (``self._embedding_dtype``, normally assigned in
-    # ``__init__``). Matches the bfloat16 ``_tts_pad_embed`` and the bf16
-    # assertions below.
-    model._embedding_dtype = torch.bfloat16
 
     def _default_raise(**_kwargs):
         raise AssertionError("build_prompt_embeds was not stubbed in this test")

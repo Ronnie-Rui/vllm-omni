@@ -763,9 +763,7 @@ def test_flush_decode_preprocess_batch_mtp_writes_back_and_stages():
     assert input_ids[1].item() == 106  # 6 + 100
 
     # (b) MTP staging populated the talker buffers...
-    torch.testing.assert_close(
-        runner.last_talker_hidden.gpu[:2], torch.full((2, 4), 7.0)
-    )
+    torch.testing.assert_close(runner.last_talker_hidden.gpu[:2], torch.full((2, 4), 7.0))
     torch.testing.assert_close(runner.text_step.gpu[:2], torch.full((2, 4), 9.0))
     assert runner.talker_mtp_input_ids.gpu[0].item() == 105
     assert runner.talker_mtp_input_ids.gpu[1].item() == 106

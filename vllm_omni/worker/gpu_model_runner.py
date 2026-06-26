@@ -1518,14 +1518,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         )
 
     def _resolve_batch_decode_preprocess(self) -> "Callable | None":
-        """Return the model's batched decode-preprocess hook only if it overrides one.
+        """Return the batched decode-preprocess hook when the model overrides it.
 
-        The mixin's default raises ``NotImplementedError``, so a plain ``getattr``
-        would treat merely-inheriting stages as having the hook; we compare against
-        the default and return None for those (they keep the scalar path).
-
-        ``VLLM_OMNI_DISABLE_BATCH_DECODE_PREPROCESS=1`` forces the scalar path even
-        when the hook exists (A/B kill-switch for issue #4383 measurement).
+        The mixin default raises, so inherited defaults keep the scalar path.
+        ``VLLM_OMNI_DISABLE_BATCH_DECODE_PREPROCESS=1`` is the A/B kill switch.
         """
         if os.environ.get("VLLM_OMNI_DISABLE_BATCH_DECODE_PREPROCESS", "").lower() in ("1", "true", "yes", "on"):
             return None
@@ -1547,17 +1543,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         decode_req_ids: list[str],
         decode_start_offsets: list[int],
     ) -> torch.Tensor | None:
-        """Process one accumulated decode batch through the batched hook.
-
-        This is the body of the ``flush_decode_batch`` step in :meth:`_preprocess`,
-        extracted as a method so the mixed prefill/decode flushing behavior can be
-        unit-tested without driving the full runner. Writes processed embeds/ids
-        back at each request's row (model-agnostic), then stages MTP compute inputs
-        only when the stage returned ``extras["mtp_inputs"]``. ``decode_req_ids`` /
-        ``decode_start_offsets`` are appended to (in place) only for rows that were
-        actually staged into the MTP buffers, keeping them in sync with the later
-        ``_talker_mtp_forward``. Returns ``inputs_embeds`` (possibly newly allocated).
-        """
+        """Run the batched hook, write ids/embeds back, and merge updates."""
         if not decode_batch_items:
             return inputs_embeds
 
@@ -1565,7 +1551,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         start_offsets_b = [item[1] for item in decode_batch_items]
         req_infos_b = [item[2] for item in decode_batch_items]
         ids_b = torch.stack([input_ids[offset : offset + 1].reshape(-1)[0] for offset in start_offsets_b])
-        # 4-tuple contract; extras is None for non-MTP stages (see CustomProcessMixin).
         req_input_ids, req_embeds, updates, extras = batch_decode_preprocess(
             input_ids=ids_b,
             req_infos=req_infos_b,
@@ -1581,7 +1566,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         inputs_embeds.index_copy_(0, offsets_t, req_embeds)
         input_ids.index_copy_(0, offsets_t, req_input_ids.reshape(-1).to(dtype=input_ids.dtype))
 
-        # MTP-only: stage transient compute inputs. Non-MTP stages return extras=None and skip.
+        # Non-MTP stages return extras=None and skip this block.
         mtp_inputs = extras.get("mtp_inputs") if isinstance(extras, dict) else None
         if mtp_inputs is not None:
             last_talker_hidden, text_step = mtp_inputs
@@ -1590,7 +1575,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.talker_mtp_inputs_embeds.gpu[dst].copy_(req_embeds)
             self.last_talker_hidden.gpu[dst].copy_(last_talker_hidden)
             self.text_step.gpu[dst].copy_(text_step)
-            # extend only when buffer was written, to keep these in sync with the MTP forward.
             decode_req_ids.extend(req_ids_b)
             decode_start_offsets.extend(start_offsets_b)
 
