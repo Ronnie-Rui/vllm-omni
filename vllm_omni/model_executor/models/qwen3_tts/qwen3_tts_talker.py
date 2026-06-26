@@ -824,11 +824,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         *,
         input_ids: torch.Tensor,
         req_infos: list[dict[str, Any]],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[dict[str, Any]]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]], dict[str, Any]]:
         """Batch the decode-only preprocess path for Qwen3-TTS.
 
-        This mirrors the scalar decode branch in ``preprocess()``, but performs
-        the token embedding lookup once for the whole decode batch.
+        Mirrors the scalar decode branch in ``preprocess()`` but does the token
+        embedding lookup once for the whole batch. Implements the generic
+        :meth:`CustomProcessMixin.preprocess_decode_batch` contract; the MTP
+        tensors ride in ``extras`` (see that contract for why).
         """
         input_ids_flat = input_ids.reshape(-1)
         if int(input_ids_flat.numel()) != len(req_infos):
@@ -919,12 +921,18 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             dtype=dtype,
         )
         inputs_embeds_out = inputs_embeds_out.reshape(len(req_infos), -1)
+        # MTP tensors go in the optional ``extras`` (consumed this step, not persisted).
+        extras = {
+            "mtp_inputs": (
+                torch.cat(past_hidden_list, dim=0),
+                torch.cat(text_step_list, dim=0),
+            ),
+        }
         return (
             input_ids_flat,
             inputs_embeds_out,
-            torch.cat(past_hidden_list, dim=0),
-            torch.cat(text_step_list, dim=0),
             updates,
+            extras,
         )
 
     def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:

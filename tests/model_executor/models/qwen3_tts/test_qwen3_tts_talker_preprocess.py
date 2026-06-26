@@ -38,6 +38,11 @@ def _make_minimal_talker(
     if tts_pad_embed is None:
         tts_pad_embed = torch.zeros((1, 4), dtype=torch.bfloat16)
     model._tts_pad_embed = tts_pad_embed
+    # ``__init__`` is skipped above, so set the embedding dtype the preprocess /
+    # decode paths read (``self._embedding_dtype``, normally assigned in
+    # ``__init__``). Matches the bfloat16 ``_tts_pad_embed`` and the bf16
+    # assertions below.
+    model._embedding_dtype = torch.bfloat16
 
     def _default_raise(**_kwargs):
         raise AssertionError("build_prompt_embeds was not stubbed in this test")
@@ -299,7 +304,7 @@ def test_decode_batch_preprocess_matches_decode_state_updates():
     last_a = torch.full((4,), 2.0, dtype=torch.float32)
     last_b = torch.full((4,), 3.0, dtype=torch.float32)
 
-    out_ids, out_embeds, past_hidden, text_step, updates = model.preprocess_decode_batch(
+    out_ids, out_embeds, updates, extras = model.preprocess_decode_batch(
         input_ids=torch.tensor([101, 202], dtype=torch.long),
         req_infos=[
             {
@@ -317,6 +322,10 @@ def test_decode_batch_preprocess_matches_decode_state_updates():
         ],
     )
 
+    # MTP tensors are carried in the optional batch-level ``extras`` extension,
+    # not in the model-agnostic base return.
+    past_hidden, text_step = extras["mtp_inputs"]
+
     assert out_ids.tolist() == [101, 202]
     assert torch.equal(out_embeds.cpu(), torch.tensor([[101.0] * 4, [202.0] * 4], dtype=torch.bfloat16))
     assert torch.equal(past_hidden.cpu(), torch.stack([last_a, last_b]).to(torch.bfloat16))
@@ -328,6 +337,103 @@ def test_decode_batch_preprocess_matches_decode_state_updates():
     assert updates[1]["meta"]["talker_text_offset"] == 0
     assert updates[1]["meta"]["codec_streaming"] is False
     assert updates[1]["hidden_states"]["trailing_text"].numel() == 0
+
+
+def _assert_nested_payload_equal(left, right):
+    if isinstance(left, torch.Tensor) or isinstance(right, torch.Tensor):
+        assert isinstance(left, torch.Tensor)
+        assert isinstance(right, torch.Tensor)
+        torch.testing.assert_close(left, right)
+        return
+    if isinstance(left, dict) or isinstance(right, dict):
+        assert isinstance(left, dict)
+        assert isinstance(right, dict)
+        assert left.keys() == right.keys()
+        for key in left:
+            _assert_nested_payload_equal(left[key], right[key])
+        return
+    if isinstance(left, (list, tuple)) or isinstance(right, (list, tuple)):
+        assert type(left) is type(right)
+        assert len(left) == len(right)
+        for left_item, right_item in zip(left, right):
+            _assert_nested_payload_equal(left_item, right_item)
+        return
+    assert left == right
+
+
+def test_decode_batch_preprocess_matches_scalar_outputs():
+    tts_pad = torch.full((1, 4), -1.0, dtype=torch.bfloat16)
+    model = _make_minimal_talker(tts_pad_embed=tts_pad)
+
+    def fake_embed_input_ids(input_ids):
+        return input_ids.reshape(-1).to(torch.float32).reshape(-1, 1, 1).expand(-1, 1, 4)
+
+    model.embed_input_ids = fake_embed_input_ids
+
+    def make_req_infos():
+        trailing_a = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        trailing_b = torch.arange(8, dtype=torch.float32).reshape(2, 4) + 100
+        trailing_c = torch.arange(130 * 4, dtype=torch.float32).reshape(130, 4) + 1000
+        return [
+            {
+                "text": ["hello"],
+                "task_type": ["Base"],
+                "hidden_states": {"trailing_text": trailing_a, "last": torch.full((4,), 2.0, dtype=torch.float32)},
+                "meta": {"talker_text_offset": 1},
+            },
+            {
+                "text": ["world"],
+                "task_type": ["CustomVoice"],
+                "hidden_states": {"trailing_text": trailing_b, "last": torch.full((4,), 3.0, dtype=torch.float32)},
+                "meta": {"talker_text_offset": 2, "codec_streaming": [False]},
+            },
+            {
+                "text": ["long tail"],
+                "task_type": ["CustomVoice"],
+                "hidden_states": {"trailing_text": trailing_c, "last": torch.arange(4, dtype=torch.float32) + 4},
+                "meta": {"talker_text_offset": 64},
+            },
+        ]
+
+    scalar_req_infos = make_req_infos()
+    batched_req_infos = make_req_infos()
+    input_ids = torch.tensor([101, 202, 303], dtype=torch.long)
+
+    scalar_ids = []
+    scalar_embeds = []
+    scalar_past_hidden = []
+    scalar_text_step = []
+    scalar_updates = []
+    for input_id, req_info in zip(input_ids, scalar_req_infos):
+        req_ids, req_embeds, update = model.preprocess(
+            input_ids=input_id.reshape(1),
+            input_embeds=None,
+            _omni_is_prefill=False,
+            _omni_num_computed_tokens=2,
+            _omni_prompt_len=2,
+            **req_info,
+        )
+        update = dict(update)
+        past_hidden, text_step = update.pop("mtp_inputs")
+        scalar_ids.append(req_ids.reshape(-1))
+        scalar_embeds.append(req_embeds.reshape(1, -1))
+        scalar_past_hidden.append(past_hidden.reshape(1, -1))
+        scalar_text_step.append(text_step.reshape(1, -1))
+        scalar_updates.append(update)
+
+    batched_ids, batched_embeds, batched_updates, extras = model.preprocess_decode_batch(
+        input_ids=input_ids,
+        req_infos=batched_req_infos,
+    )
+    batched_past_hidden, batched_text_step = extras["mtp_inputs"]
+
+    torch.testing.assert_close(batched_ids, torch.cat(scalar_ids, dim=0))
+    torch.testing.assert_close(batched_embeds, torch.cat(scalar_embeds, dim=0))
+    torch.testing.assert_close(batched_past_hidden, torch.cat(scalar_past_hidden, dim=0))
+    torch.testing.assert_close(batched_text_step, torch.cat(scalar_text_step, dim=0))
+    assert len(batched_updates) == len(scalar_updates)
+    for batched_update, scalar_update in zip(batched_updates, scalar_updates):
+        _assert_nested_payload_equal(batched_update, scalar_update)
 
 
 def _stub_text_embedding(device_param: torch.nn.Parameter):

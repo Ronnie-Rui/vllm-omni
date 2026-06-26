@@ -1,5 +1,6 @@
 import contextlib
 import inspect
+import os
 from collections.abc import Callable
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
@@ -31,6 +32,7 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
 from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
@@ -1515,6 +1517,89 @@ class OmniGPUModelRunner(GPUModelRunner):
             device=device,
         )
 
+    def _resolve_batch_decode_preprocess(self) -> "Callable | None":
+        """Return the model's batched decode-preprocess hook only if it overrides one.
+
+        The mixin's default raises ``NotImplementedError``, so a plain ``getattr``
+        would treat merely-inheriting stages as having the hook; we compare against
+        the default and return None for those (they keep the scalar path).
+
+        ``VLLM_OMNI_DISABLE_BATCH_DECODE_PREPROCESS=1`` forces the scalar path even
+        when the hook exists (A/B kill-switch for issue #4383 measurement).
+        """
+        if os.environ.get("VLLM_OMNI_DISABLE_BATCH_DECODE_PREPROCESS", "").lower() in ("1", "true", "yes", "on"):
+            return None
+        hook = getattr(self.model, "preprocess_decode_batch", None)
+        if not callable(hook):
+            return None
+        base_hook = getattr(CustomProcessMixin, "preprocess_decode_batch", None)
+        hook_func = getattr(hook, "__func__", hook)
+        if base_hook is not None and hook_func is base_hook:
+            return None
+        return hook
+
+    def _flush_decode_preprocess_batch(
+        self,
+        batch_decode_preprocess: "Callable",
+        decode_batch_items: list,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor | None,
+        decode_req_ids: list[str],
+        decode_start_offsets: list[int],
+    ) -> torch.Tensor | None:
+        """Process one accumulated decode batch through the batched hook.
+
+        This is the body of the ``flush_decode_batch`` step in :meth:`_preprocess`,
+        extracted as a method so the mixed prefill/decode flushing behavior can be
+        unit-tested without driving the full runner. Writes processed embeds/ids
+        back at each request's row (model-agnostic), then stages MTP compute inputs
+        only when the stage returned ``extras["mtp_inputs"]``. ``decode_req_ids`` /
+        ``decode_start_offsets`` are appended to (in place) only for rows that were
+        actually staged into the MTP buffers, keeping them in sync with the later
+        ``_talker_mtp_forward``. Returns ``inputs_embeds`` (possibly newly allocated).
+        """
+        if not decode_batch_items:
+            return inputs_embeds
+
+        req_ids_b = [item[0] for item in decode_batch_items]
+        start_offsets_b = [item[1] for item in decode_batch_items]
+        req_infos_b = [item[2] for item in decode_batch_items]
+        ids_b = torch.stack([input_ids[offset : offset + 1].reshape(-1)[0] for offset in start_offsets_b])
+        # 4-tuple contract; extras is None for non-MTP stages (see CustomProcessMixin).
+        req_input_ids, req_embeds, updates, extras = batch_decode_preprocess(
+            input_ids=ids_b,
+            req_infos=req_infos_b,
+        )
+        if inputs_embeds is None:
+            inputs_embeds = torch.empty(
+                (input_ids.shape[0], req_embeds.shape[-1]),
+                device=req_embeds.device,
+                dtype=req_embeds.dtype,
+            )
+
+        offsets_t = torch.tensor(start_offsets_b, device=req_embeds.device, dtype=torch.long)
+        inputs_embeds.index_copy_(0, offsets_t, req_embeds)
+        input_ids.index_copy_(0, offsets_t, req_input_ids.reshape(-1).to(dtype=input_ids.dtype))
+
+        # MTP-only: stage transient compute inputs. Non-MTP stages return extras=None and skip.
+        mtp_inputs = extras.get("mtp_inputs") if isinstance(extras, dict) else None
+        if mtp_inputs is not None:
+            last_talker_hidden, text_step = mtp_inputs
+            dst = slice(len(decode_req_ids), len(decode_req_ids) + len(req_ids_b))
+            self.talker_mtp_input_ids.gpu[dst].copy_(req_input_ids.reshape(-1))
+            self.talker_mtp_inputs_embeds.gpu[dst].copy_(req_embeds)
+            self.last_talker_hidden.gpu[dst].copy_(last_talker_hidden)
+            self.text_step.gpu[dst].copy_(text_step)
+            # extend only when buffer was written, to keep these in sync with the MTP forward.
+            decode_req_ids.extend(req_ids_b)
+            decode_start_offsets.extend(start_offsets_b)
+
+        for req_id_b, update_dict_b in zip(req_ids_b, updates, strict=True):
+            self._update_intermediate_buffer(req_id_b, update_dict_b)
+
+        decode_batch_items.clear()
+        return inputs_embeds
+
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1665,44 +1750,19 @@ class OmniGPUModelRunner(GPUModelRunner):
             decode_req_ids = []
             decode_start_offsets = []
             decode_batch_items = []
-            batch_decode_preprocess = getattr(self.model, "preprocess_decode_batch", None)
+            batch_decode_preprocess = self._resolve_batch_decode_preprocess()
+            has_batch_decode_preprocess = batch_decode_preprocess is not None
 
             def flush_decode_batch() -> None:
                 nonlocal inputs_embeds
-                if not decode_batch_items:
-                    return
-
-                req_ids_b = [item[0] for item in decode_batch_items]
-                start_offsets_b = [item[1] for item in decode_batch_items]
-                req_infos_b = [item[2] for item in decode_batch_items]
-                ids_b = torch.stack([input_ids[offset : offset + 1].reshape(-1)[0] for offset in start_offsets_b])
-                req_input_ids, req_embeds, last_talker_hidden, text_step, updates = batch_decode_preprocess(
-                    input_ids=ids_b,
-                    req_infos=req_infos_b,
+                inputs_embeds = self._flush_decode_preprocess_batch(
+                    batch_decode_preprocess,
+                    decode_batch_items,
+                    input_ids,
+                    inputs_embeds,
+                    decode_req_ids,
+                    decode_start_offsets,
                 )
-                if inputs_embeds is None:
-                    inputs_embeds = torch.empty(
-                        (input_ids.shape[0], req_embeds.shape[-1]),
-                        device=req_embeds.device,
-                        dtype=req_embeds.dtype,
-                    )
-
-                offsets_t = torch.tensor(start_offsets_b, device=req_embeds.device, dtype=torch.long)
-                inputs_embeds.index_copy_(0, offsets_t, req_embeds)
-                input_ids.index_copy_(0, offsets_t, req_input_ids.reshape(-1).to(dtype=input_ids.dtype))
-
-                dst = slice(len(decode_req_ids), len(decode_req_ids) + len(req_ids_b))
-                self.talker_mtp_input_ids.gpu[dst].copy_(req_input_ids.reshape(-1))
-                self.talker_mtp_inputs_embeds.gpu[dst].copy_(req_embeds)
-                self.last_talker_hidden.gpu[dst].copy_(last_talker_hidden)
-                self.text_step.gpu[dst].copy_(text_step)
-
-                for req_id_b, update_dict_b in zip(req_ids_b, updates, strict=True):
-                    self._update_intermediate_buffer(req_id_b, update_dict_b)
-
-                decode_req_ids.extend(req_ids_b)
-                decode_start_offsets.extend(start_offsets_b)
-                decode_batch_items.clear()
 
             for req_index, req_id in enumerate(self.input_batch.req_ids):
                 req_infos = self.model_intermediate_buffer.get(req_id, {})
@@ -1725,7 +1785,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                 req_infos["_omni_prompt_len"] = prompt_len
                 req_infos["_omni_num_computed_tokens"] = num_computed_tokens
                 req_infos["_omni_is_prefill"] = is_prefill
-                if callable(batch_decode_preprocess) and self.has_talker_mtp and span_len == 1 and not is_prefill:
+                # Batched fast path for steady-state decode rows. Not gated on has_talker_mtp.
+                if has_batch_decode_preprocess and span_len == 1 and not is_prefill:
                     decode_batch_items.append((req_id, s, req_infos))
                     continue
 

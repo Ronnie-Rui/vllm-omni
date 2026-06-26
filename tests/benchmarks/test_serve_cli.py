@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 import textwrap
 from pathlib import Path
@@ -118,8 +119,12 @@ def test_bench_serve_cli_mocks_http_request(tmp_path: Path):
     env["PYTHONPATH"] = str(tmp_path) + os.pathsep + env.get("PYTHONPATH", "")
     env["VLLM_OMNI_TEST_POST_CALLS_FILE"] = str(calls_path)
 
+    vllm_executable = shutil.which("vllm")
+    if vllm_executable is None:
+        pytest.skip("vllm console script is not installed in this environment")
+
     cmd = [
-        "vllm",
+        vllm_executable,
         "bench",
         "serve",
         "--omni",

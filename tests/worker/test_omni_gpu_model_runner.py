@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner, _filter_mrope_kwargs_for_model
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
@@ -655,3 +656,195 @@ def test_maybe_attach_mimo_audio_req_infos_no_req_state_returns_input():
 
     # When no req_state, helper should be a no-op.
     assert result is req_infos
+
+
+class _OverridingStage(CustomProcessMixin):
+    """A stage that genuinely implements the batched decode hook."""
+
+    def preprocess_decode_batch(self, *, input_ids, req_infos):
+        return input_ids, input_ids, [{} for _ in req_infos], None
+
+
+class _InheritingStage(CustomProcessMixin):
+    """A stage that inherits the mixin but does NOT override the hook."""
+
+
+def test_resolve_batch_decode_preprocess_returns_override():
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = _OverridingStage()
+
+    hook = OmniGPUModelRunner._resolve_batch_decode_preprocess(runner)
+
+    assert hook is not None
+    assert getattr(hook, "__func__", hook) is _OverridingStage.preprocess_decode_batch
+
+
+def test_resolve_batch_decode_preprocess_skips_inherited_default():
+    # A stage that only inherits the mixin's raising default must NOT be
+    # treated as a batching stage, or the runner would route decode rows into
+    # a NotImplementedError instead of the scalar fallback.
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = _InheritingStage()
+
+    assert OmniGPUModelRunner._resolve_batch_decode_preprocess(runner) is None
+
+
+def test_resolve_batch_decode_preprocess_skips_model_without_hook():
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace()  # no preprocess_decode_batch at all
+
+    assert OmniGPUModelRunner._resolve_batch_decode_preprocess(runner) is None
+
+
+def _make_mtp_hook(hidden_size=4):
+    """Return a fake batched-decode hook that mimics an MTP stage (extras set)."""
+
+    def hook(*, input_ids, req_infos):
+        n = len(req_infos)
+        req_input_ids = (input_ids.reshape(-1) + 100).to(torch.int64)
+        req_embeds = torch.arange(n * hidden_size, dtype=torch.float32).reshape(n, hidden_size)
+        updates = [{"step": i} for i in range(n)]
+        extras = {
+            "mtp_inputs": (
+                torch.full((n, hidden_size), 7.0),
+                torch.full((n, hidden_size), 9.0),
+            )
+        }
+        return req_input_ids, req_embeds, updates, extras
+
+    return hook
+
+
+def _make_non_mtp_hook(hidden_size=4):
+    """Return a fake batched-decode hook for a non-MTP stage (extras=None)."""
+
+    def hook(*, input_ids, req_infos):
+        n = len(req_infos)
+        req_input_ids = (input_ids.reshape(-1) + 100).to(torch.int64)
+        req_embeds = torch.arange(n * hidden_size, dtype=torch.float32).reshape(n, hidden_size)
+        updates = [{"step": i} for i in range(n)]
+        return req_input_ids, req_embeds, updates, None
+
+    return hook
+
+
+def test_flush_decode_preprocess_batch_mtp_writes_back_and_stages():
+    # Mixed prefill/decode flush: only the decode rows accumulated in
+    # decode_batch_items are processed; an MTP stage stages the talker buffers
+    # AND extends decode_req_ids/decode_start_offsets so the later MTP forward
+    # stays in sync with the rows that were actually staged.
+    runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
+
+    input_ids = torch.tensor([5, 6, 0, 0], dtype=torch.int64)
+    inputs_embeds = None
+    decode_req_ids: list[str] = []
+    decode_start_offsets: list[int] = []
+    decode_batch_items = [
+        ("r1", 0, {"_omni_is_prefill": False}),
+        ("r2", 1, {"_omni_is_prefill": False}),
+    ]
+
+    out = OmniGPUModelRunner._flush_decode_preprocess_batch(
+        runner,
+        _make_mtp_hook(hidden_size=4),
+        decode_batch_items,
+        input_ids,
+        inputs_embeds,
+        decode_req_ids,
+        decode_start_offsets,
+    )
+
+    # (a) model-agnostic embeds/ids write-back at the right rows.
+    assert out is not None
+    assert out.shape == (4, 4)
+    torch.testing.assert_close(out[0], torch.arange(0, 4, dtype=torch.float32))
+    torch.testing.assert_close(out[1], torch.arange(4, 8, dtype=torch.float32))
+    assert input_ids[0].item() == 105  # 5 + 100
+    assert input_ids[1].item() == 106  # 6 + 100
+
+    # (b) MTP staging populated the talker buffers...
+    torch.testing.assert_close(
+        runner.last_talker_hidden.gpu[:2], torch.full((2, 4), 7.0)
+    )
+    torch.testing.assert_close(runner.text_step.gpu[:2], torch.full((2, 4), 9.0))
+    assert runner.talker_mtp_input_ids.gpu[0].item() == 105
+    assert runner.talker_mtp_input_ids.gpu[1].item() == 106
+    # ...and extended the sync lists only because rows were staged.
+    assert decode_req_ids == ["r1", "r2"]
+    assert decode_start_offsets == [0, 1]
+
+    # (d) per-request updates merged into the intermediate buffer.
+    assert runner.model_intermediate_buffer["r1"]["step"] == 0
+    assert runner.model_intermediate_buffer["r2"]["step"] == 1
+
+    # decode batch is drained after a flush.
+    assert decode_batch_items == []
+
+
+def test_flush_decode_preprocess_batch_non_mtp_skips_staging():
+    # A non-MTP stage returns extras=None: embeds/ids are still written back and
+    # updates merged, but the MTP buffers are left untouched and the sync lists
+    # are NOT extended (so no phantom rows reach the MTP forward).
+    runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
+
+    input_ids = torch.tensor([5, 6, 0, 0], dtype=torch.int64)
+    decode_req_ids: list[str] = []
+    decode_start_offsets: list[int] = []
+    decode_batch_items = [
+        ("r1", 0, {"_omni_is_prefill": False}),
+        ("r2", 1, {"_omni_is_prefill": False}),
+    ]
+
+    out = OmniGPUModelRunner._flush_decode_preprocess_batch(
+        runner,
+        _make_non_mtp_hook(hidden_size=4),
+        decode_batch_items,
+        input_ids,
+        None,
+        decode_req_ids,
+        decode_start_offsets,
+    )
+
+    # Model-agnostic write-back still happens.
+    assert out is not None
+    torch.testing.assert_close(out[0], torch.arange(0, 4, dtype=torch.float32))
+    assert input_ids[0].item() == 105
+
+    # MTP buffers untouched (still zero) and sync lists not extended.
+    assert torch.count_nonzero(runner.last_talker_hidden.gpu) == 0
+    assert torch.count_nonzero(runner.text_step.gpu) == 0
+    assert torch.count_nonzero(runner.talker_mtp_input_ids.gpu) == 0
+    assert decode_req_ids == []
+    assert decode_start_offsets == []
+
+    # Updates are still merged for non-MTP stages.
+    assert runner.model_intermediate_buffer["r1"]["step"] == 0
+    assert runner.model_intermediate_buffer["r2"]["step"] == 1
+    assert decode_batch_items == []
+
+
+def test_flush_decode_preprocess_batch_empty_is_noop():
+    # No accumulated decode rows (e.g. an all-prefill step): the hook must not be
+    # called and inputs_embeds is returned unchanged.
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+
+    sentinel = torch.zeros((1, 4), dtype=torch.float32)
+    decode_req_ids: list[str] = []
+    decode_start_offsets: list[int] = []
+
+    def _boom(**kwargs):
+        raise AssertionError("hook must not be called for an empty decode batch")
+
+    out = OmniGPUModelRunner._flush_decode_preprocess_batch(
+        runner,
+        _boom,
+        [],
+        torch.tensor([5], dtype=torch.int64),
+        sentinel,
+        decode_req_ids,
+        decode_start_offsets,
+    )
+
+    assert out is sentinel
+    assert decode_req_ids == []
+    assert decode_start_offsets == []

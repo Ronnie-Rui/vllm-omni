@@ -150,6 +150,62 @@ python benchmarks/tts/plot_results.py \
 Outputs TTFP / RTF / throughput curves (and a markdown table) for every
 `(task, concurrency)` combination in the result set.
 
+### 5. Decode preprocess microbenchmark
+
+Times the host-side decode preprocess overhead without model weights or a
+serving stack — compares the runner's per-request scalar loop
+(`model.preprocess(...)` once per request) against `model.preprocess_decode_batch(...)`
+on synthetic decode states, with output parity checked by default:
+
+```bash
+python benchmarks/tts/bench_qwen3_tts_decode_preprocess.py \
+    --device cuda --batch-sizes 1 2 4 8 16 32 64 \
+    --hidden-size 4096 --tail-frames 128 --warmups 20 --repeats 100 \
+    --output-json ./results/qwen3_tts_decode_preprocess.json
+```
+
+This dependency-light benchmark uses a local PyTorch mirror of the Qwen3-TTS
+decode preprocess logic. It is an isolated operator-level measurement, not a
+reproduction of the full serving trace.
+
+### 6. Engine-level scalar-vs-batched A/B
+
+Run the real serving benchmark twice on the same GPU/model/dataset, toggling
+only the batched fast path via a server-side env var, then diff the result
+sets. The fast path is on by default for any stage implementing
+`preprocess_decode_batch`; set `VLLM_OMNI_DISABLE_BATCH_DECODE_PREPROCESS=1` on
+the **server** to force the scalar loop (the baseline). The bench client is
+unchanged.
+
+```bash
+# A: scalar baseline (fast path disabled)
+VLLM_OMNI_DISABLE_BATCH_DECODE_PREPROCESS=1 \
+    vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni --port 8000 &
+python benchmarks/tts/bench_tts.py \
+    --model Qwen/Qwen3-TTS-12Hz-1.7B-Base --task voice_clone \
+    --dataset-path /path/to/seed-tts-eval \
+    --concurrency 1 8 32 --num-prompts 64 --output-dir ./results/scalar
+# stop the server.
+
+# B: batched fast path (default)
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni --port 8000 &
+python benchmarks/tts/bench_tts.py \
+    --model Qwen/Qwen3-TTS-12Hz-1.7B-Base --task voice_clone \
+    --dataset-path /path/to/seed-tts-eval \
+    --concurrency 1 8 32 --num-prompts 64 --output-dir ./results/batched
+# stop the server.
+
+# Diff the two sweeps
+python benchmarks/tts/compare_decode_preprocess_ab.py \
+    --scalar ./results/scalar --batched ./results/batched \
+    --output-json ./results/ab_table.json
+```
+
+`compare_decode_preprocess_ab.py` matches runs by concurrency, prints a
+TTFP / E2E-latency / throughput delta table, and **fails (non-zero exit) if
+concurrency=1 regresses** beyond a tolerance (default 5%, override with
+`--c1-tolerance`). Run each sweep on a quiesced GPU.
+
 ## Task types
 
 | Task            | Dataset           | Request body                                        | Checkpoints that support it              |
