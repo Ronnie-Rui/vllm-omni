@@ -5,11 +5,13 @@ import inspect
 import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, cast
 
 import numpy as np
 import regex as re
 import torch
+from cache_dit import ForwardPattern
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
@@ -32,7 +34,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -59,6 +60,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -73,6 +75,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe import HunyuanFusedMoE
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
@@ -460,6 +463,22 @@ class Resolution:
         self.w = self.width = size[1]
         self.r = self.ratio = self.height / self.width
 
+        self.extra_res = set()
+
+    def match(self, width, height) -> tuple[int, int]:
+        if not self.extra_res:
+            return self.w, self.h
+        else:
+            ret_w, ret_h = self.w, self.h
+            target_area = width * height
+            min_area_diff = abs((self.w * self.h) - target_area)
+            for res in self.extra_res:
+                area_diff = abs((res[0] * res[1]) - target_area)
+                if area_diff < min_area_diff:
+                    min_area_diff = area_diff
+                    ret_w, ret_h = res[0], res[1]
+            return (ret_w, ret_h)
+
     def __getitem__(self, idx):
         if idx == 0:
             return self.h
@@ -470,6 +489,19 @@ class Resolution:
 
     def __str__(self):
         return f"{self.h}x{self.w}"
+
+    def __repr__(self) -> str:
+        if not self.extra_res:
+            return "{" + f"{self.h}x{self.w}" + "}"
+        else:
+            ret_str = "{" + f"[{self.h}x{self.w}]"
+            for er in self.extra_res:
+                ret_str = ret_str + f"[{er[0]}x{er[1]}]"
+            ret_str = ret_str + "}"
+            return ret_str
+
+    def append(self, res: "Resolution"):
+        self.extra_res.add((res.w, res.h))
 
 
 # Baked-in extras matching the official model's
@@ -482,6 +514,10 @@ HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS: tuple[str, ...] = (
     "1280x720",
     "768x1024",
     "720x1280",
+    "512x512",
+    "640x640",
+    "768x768",
+    "896x896",
 )
 
 
@@ -502,12 +538,17 @@ class ResolutionGroup:
 
         if extra_resolutions is not None:
             for er in extra_resolutions:
-                if not any(r.ratio == er.ratio for r in self.data):
+                for r in self.data:
+                    if r.ratio == er.ratio:
+                        r.append(er)
+                        break
+                else:
                     self.data.append(er)
 
         self.ratio = np.array([x.ratio for x in self.data])
         self.attr = ["" for _ in range(len(self.data))]
         self.prefix_space = 0
+        logger.debug(f"ResolutionGroup: {self}")
 
     def __len__(self):
         return len(self.data)
@@ -523,13 +564,27 @@ class ResolutionGroup:
         res_str += (
             f"\n{prefix}ID: height width   ratio {' ' * max(0, attr_maxlen - 4)}count  h/16 w/16    tokens\n{prefix}"
         )
-        res_str += ("\n" + prefix).join(
-            [
+
+        rows = []
+        for i, x in enumerate(self.data):
+            main_row = (
                 f"{i:2d}: ({x.h:4d}, {x.w:4d})  {self.ratio[i]:.4f}  {self.attr[i]:>{attr_maxlen}s}  "
                 f"({x.h // 16:3d}, {x.w // 16:3d})  {x.h // 16 * x.w // 16:6d}"
-                for i, x in enumerate(self.data)
-            ]
-        )
+            )
+            rows.append(main_row)
+            extra_val = getattr(x, "extra_res", None)
+            if extra_val:
+                for sub_h, sub_w in sorted(list(extra_val)):
+                    sub_ratio = sub_h / sub_w
+                    sub_h16, sub_w16 = sub_h // 16, sub_w // 16
+                    sub_tokens = sub_h16 * sub_w16
+                    sub_row = (
+                        f"    ({sub_h:4d}, {sub_w:4d})  {sub_ratio:.4f}  {' ' * attr_maxlen}  "
+                        f"({sub_h16:3d}, {sub_w16:3d})  {sub_tokens:6d}"
+                    )
+                    rows.append(sub_row)
+
+        res_str += ("\n" + prefix).join(rows)
         res_str += f"\n{prefix_close})"
         return res_str
 
@@ -568,13 +623,20 @@ class ResolutionGroup:
     def get_target_size(self, width, height):
         ratio = height / width
         idx = np.argmin(np.abs(self.ratio - ratio))
-        reso = self.data[idx]
-        return reso.w, reso.h
+        w, h = self.data[idx].match(width, height)
+        return w, h
 
     def get_base_size_and_ratio_index(self, width, height):
         ratio = height / width
         idx = np.argmin(np.abs(self.ratio - ratio))
         return self.base_size, idx
+
+
+@lru_cache(maxsize=4)
+def get_cached_resolution_group(base_size: int) -> ResolutionGroup:
+    extra_res_tuple = tuple(Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS)
+    extra_resolutions = list(extra_res_tuple) if extra_res_tuple else None
+    return ResolutionGroup(base_size=base_size, extra_resolutions=extra_resolutions)
 
 
 class ImageInfo:
@@ -891,6 +953,7 @@ class ImageKVCacheManager:
         # cache related
         self.image_token_len: int = image_token_len
         self.image_kv_cache_map: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.image_kv_cache_lens: torch.Tensor | None = None
         self._injected_ar_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
 
         self.sp_size = get_sequence_parallel_world_size()
@@ -904,12 +967,23 @@ class ImageKVCacheManager:
             prefix=f"{prefix}.attn" if prefix else "",
         )
 
+    @staticmethod
+    def _get_current_starts(
+        gen_timestep_scatter_index: torch.Tensor | None,
+        ar_kv_len: int = 0,
+    ) -> torch.Tensor:
+        assert gen_timestep_scatter_index is not None, (
+            "`gen_timestep_scatter_index` is required to locate the generated image timestep token for image KV reuse."
+        )
+        return gen_timestep_scatter_index[:, -1].to(dtype=torch.long) + ar_kv_len
+
     def _cache_prompt_kv(
         self,
         key: torch.Tensor,
         value: torch.Tensor,
         seq_len: int,
         shard_image_size: int | None = None,
+        gen_timestep_scatter_index: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Cache prompt KV on first_step. Consumes _injected_ar_kv.
 
@@ -939,12 +1013,26 @@ class ImageKVCacheManager:
             key = torch.cat(new_keys, dim=0)
             value = torch.cat(new_values, dim=0)
 
-        image_size = shard_image_size if self.sp_size > 1 else (self.image_token_len + 1)
-        cached_prompt_len = seq_len - image_size
+        cached_prompt_lens = self._get_current_starts(gen_timestep_scatter_index, ar_kv_len)
+        assert torch.all(cached_prompt_lens <= key.shape[1]), (
+            f"cached_prompt_lens({cached_prompt_lens.tolist()}) must be <= key length({key.shape[1]})"
+        )
+        if shard_image_size is not None:
+            expected_prompt_len = seq_len - shard_image_size
+            assert torch.all(cached_prompt_lens == expected_prompt_len), (
+                f"cached_prompt_lens({cached_prompt_lens.tolist()}) != "
+                f"seq_len({seq_len}) - shard_image_size({shard_image_size})"
+            )
 
-        cached_key = key[:, :cached_prompt_len].reshape(-1, num_kv_heads, head_dim)
-        cached_value = value[:, :cached_prompt_len].reshape(-1, num_kv_heads, head_dim)
+        max_cached_prompt_len = int(cached_prompt_lens.max().item())
+        cached_key = key.new_zeros(bs, max_cached_prompt_len, num_kv_heads, head_dim)
+        cached_value = value.new_zeros(bs, max_cached_prompt_len, num_kv_heads, head_dim)
+        for b in range(bs):
+            cached_prompt_len = int(cached_prompt_lens[b].item())
+            cached_key[b, :cached_prompt_len] = key[b, :cached_prompt_len]
+            cached_value[b, :cached_prompt_len] = value[b, :cached_prompt_len]
         self.image_kv_cache_map = (cached_key, cached_value)
+        self.image_kv_cache_lens = cached_prompt_lens
         return key, value
 
     def _reuse_prompt_kv(
@@ -954,42 +1042,37 @@ class ImageKVCacheManager:
         seq_len: int,
         bs: int,
         shard_image_size: int | None = None,
+        position_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Reuse cached prompt KV in subsequent denoising steps.
 
-        Non-SP: returns [cached_prompt, new_image, zero_eoi] shaped [bs, seq_len, ...].
-        SP: returns cached prompt only shaped [bs, cached_prompt_len, ...] (used as joint_text).
+        Non-SP: concatenates cached prompt KV with current image KV.
+        SP: returns cached prompt KV only (used as joint_text).
         """
         cached_key, cached_value = self.image_kv_cache_map
-        _, q_len, num_kv_heads, head_dim = key.shape
-        cached_prompt_len = cached_key.shape[0] // bs
+        _, q_len, _, _ = key.shape
+        assert cached_key.dim() == 4 and cached_key.shape[0] == bs
+        max_cached_prompt_len = cached_key.shape[1]
 
         if shard_image_size is not None:
-            assert cached_prompt_len == seq_len - q_len
-            result_k = cached_key.reshape(bs, cached_prompt_len, num_kv_heads, head_dim)
-            result_v = cached_value.reshape(bs, cached_prompt_len, num_kv_heads, head_dim)
-            return result_k.contiguous(), result_v.contiguous()
+            assert max_cached_prompt_len + q_len == seq_len, (
+                f"max_cached_prompt_len({max_cached_prompt_len}) + q_len({q_len}) != seq_len({seq_len})"
+            )
+            return cached_key.contiguous(), cached_value.contiguous()
 
-        assert cached_prompt_len + 1 == seq_len - q_len, f"{cached_prompt_len + 1} != {seq_len - q_len}"
-
-        key = key.reshape(-1, num_kv_heads, head_dim)
-        value = value.reshape(-1, num_kv_heads, head_dim)
-        zero_eoi = torch.zeros(1, num_kv_heads, head_dim, device=key.device, dtype=key.dtype)
-
-        new_key, new_value = [], []
-        for b in range(bs):
-            cache_base = b * cached_prompt_len
-            img_base = b * q_len
-            new_key.append(cached_key[cache_base : cache_base + cached_prompt_len])
-            new_key.append(key[img_base : img_base + q_len])
-            new_key.append(zero_eoi)
-            new_value.append(cached_value[cache_base : cache_base + cached_prompt_len])
-            new_value.append(value[img_base : img_base + q_len])
-            new_value.append(zero_eoi)
-
-        new_key = torch.cat(new_key).reshape(bs, seq_len, num_kv_heads, head_dim)
-        new_value = torch.cat(new_value).reshape(bs, seq_len, num_kv_heads, head_dim)
+        assert max_cached_prompt_len + q_len == seq_len, (
+            f"max_cached_prompt_len({max_cached_prompt_len}) + q_len({q_len}) != seq_len({seq_len})"
+        )
+        assert self.image_kv_cache_lens is not None
+        if position_ids is not None:
+            assert position_ids.shape == (bs, q_len)
+            if logger.isEnabledFor(logging.DEBUG):
+                assert torch.all(position_ids[:, 0] == self.image_kv_cache_lens.to(position_ids.device)), (
+                    "The first current position must immediately follow each sample's cached prompt KV."
+                )
+        new_key = torch.cat([cached_key, key], dim=1)
+        new_value = torch.cat([cached_value, value], dim=1)
         return new_key.contiguous(), new_value.contiguous()
 
     def _build_neg_ar_kv(
@@ -1032,7 +1115,7 @@ class ImageKVCacheManager:
 
         query_lens = kwargs.get("query_lens")
         seq_lens = kwargs.get("seq_lens")
-        shard_image_size = kwargs.get("shard_image_size")
+        shard_image_size = kwargs.get("shard_image_size") if self.sp_size > 1 else None
         bs = len(query_lens)
         q_len = query_lens[0]
         seq_len = seq_lens[0]
@@ -1058,7 +1141,14 @@ class ImageKVCacheManager:
                 value = value[:, :0, :, :]
         elif first_step:
             self.image_kv_cache_map = None  # reset first
-            key, value = self._cache_prompt_kv(key, value, seq_len, shard_image_size)
+            self.image_kv_cache_lens = None
+            key, value = self._cache_prompt_kv(
+                key,
+                value,
+                seq_len,
+                shard_image_size,
+                kwargs.get("gen_timestep_scatter_index"),
+            )
             if self.sp_size > 1:
                 local_prompt_len = seq_len - shard_image_size
                 join_query_len = query.shape[1] - shard_image_size
@@ -1070,7 +1160,7 @@ class ImageKVCacheManager:
                 value = value[:, local_prompt_len:, :, :]
         else:
             if self.sp_size <= 1:
-                key, value = self._reuse_prompt_kv(key, value, seq_len, bs)
+                key, value = self._reuse_prompt_kv(key, value, seq_len, bs, position_ids=kwargs.get("position_ids"))
             else:
                 joint_text_query = query[:, :0, :, :]
                 joint_text_key, joint_text_value = self._reuse_prompt_kv(key, value, seq_len, bs, shard_image_size)
@@ -1379,10 +1469,7 @@ class HunyuanImage3ImageProcessor:
     def __init__(self, config):
         self.config = config
 
-        self.reso_group = ResolutionGroup(
-            base_size=config.image_base_size,
-            extra_resolutions=[Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS],
-        )
+        self.reso_group = get_cached_resolution_group(base_size=config.image_base_size)
         self.vae_processor = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -1419,6 +1506,7 @@ class HunyuanImage3ImageProcessor:
         token_height = image_height // (self.config.vae_downsample_factor[0] * self.config.patch_size)
         token_width = image_width // (self.config.vae_downsample_factor[1] * self.config.patch_size)
         base_size, ratio_idx = self.reso_group.get_base_size_and_ratio_index(image_size[1], image_size[0])
+
         image_info = ImageInfo(
             image_type="gen_image",
             image_width=image_width,
@@ -1814,6 +1902,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
+            position_ids=position_ids,
             custom_pos_emb=custom_pos_emb,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
@@ -1878,12 +1967,21 @@ class HunyuanImagePreprocessor(nn.Module):
         image_token_len: int,
         is_first_step: bool = False,
         uncond_cfg_prefill: bool = False,
+        gen_timestep_scatter_index: torch.Tensor | None = None,
     ):
         # ---------- compute prompt length ----------
         if uncond_cfg_prefill:
             prompt_len = hidden_states.shape[1]
         elif is_first_step:
-            prompt_len = hidden_states.shape[1] - image_token_len - 1
+            assert gen_timestep_scatter_index is not None, (
+                "`gen_timestep_scatter_index` is required to split prompt and "
+                "generated image tokens for sequence parallel image generation."
+            )
+            prompt_lens = gen_timestep_scatter_index[:, -1]
+            assert torch.all(prompt_lens == prompt_lens[0]), (
+                "Sequence parallel image generation requires the generated timestep position to match across the batch."
+            )
+            prompt_len = int(prompt_lens[0].item())
         else:
             prompt_len = 0
 
@@ -1922,6 +2020,13 @@ class HunyuanImagePostprocessor(nn.Module):
 
 
 class HunyuanImage3Model(nn.Module):
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "layers": ForwardPattern.Pattern_4,
+        },
+        check_forward_pattern=False,
+    )
+
     _sp_plan = {
         # Split custom_pos_emb tuple elements (cos, sin) at model forward input
         "pre_processor": {
@@ -2073,7 +2178,7 @@ class HunyuanImage3Model(nn.Module):
             return False
 
         def is_scalar_quant_scale(name: str, tensor: torch.Tensor) -> bool:
-            return tensor.numel() == 1 and name.endswith((".input_scale", ".weight_scale"))
+            return tensor.numel() == 1 and name.endswith((".input_scale", ".weight_scale", ".weight_scale_2"))
 
         def load_split_param(
             name: str,
@@ -2111,7 +2216,6 @@ class HunyuanImage3Model(nn.Module):
             return tensor[offset * units : offset * units + units]
 
         for name, loaded_weight in weights:
-            # print(f"Loading weight name: {name}, tp_rank: {tp_rank}", flush=True)
             if contains_unexpected_keyword(name, unexpected_keywords):
                 logger.warning("Skipping unexpected weight name: %s", name)
                 continue
@@ -2327,6 +2431,7 @@ class HunyuanImage3Model(nn.Module):
                 num_image_tokens,
                 first_step,
                 uncond_cfg_prefill=uncond_cfg_prefill,
+                gen_timestep_scatter_index=gen_timestep_scatter_index,
             )
             assert len(set(query_lens)) == 1 and len(set(seq_lens)) == 1, (
                 "query_lens and seq_lens must be the same for sequence parallel"
@@ -2334,15 +2439,15 @@ class HunyuanImage3Model(nn.Module):
             prompt_size = text_hidden_states.shape[1]
             shard_image_size = image_hidden_states.shape[1]
 
-            if first_step:  # [image tokens, last token]
-                shard_padding_size = shard_image_size * sp_world_size - (num_image_tokens + 1)
-            else:  # [image tokens, last token]
+            if first_step:
+                shard_padding_size = shard_image_size * sp_world_size - (origin_query_len - prompt_size)
+            else:
                 shard_padding_size = shard_image_size * sp_world_size - num_image_tokens
             if first_step:
                 seq_lens = [prompt_size + shard_image_size + ar_kv_reuse_len for _ in seq_lens]
             else:
                 seq_lens = [x - y for x, y in zip(seq_lens, query_lens)]
-                seq_lens = [seq_len + shard_image_size - 1 for seq_len in seq_lens]
+                seq_lens = [seq_len + shard_image_size for seq_len in seq_lens]
             query_lens = [prompt_size + shard_image_size for _ in query_lens]
 
             if prompt_size > 0:
@@ -2356,10 +2461,6 @@ class HunyuanImage3Model(nn.Module):
                 hidden_states = image_hidden_states
                 position_ids = image_position_ids
                 custom_pos_emb = (image_custom_pos_emb_sin, image_custom_pos_emb_cos)
-
-            if not first_step:
-                assert torch.all(~attention_mask[..., -1]), "The last token should not be attended to"
-                attention_mask = attention_mask[..., :-1]  # we attention without last token
 
             if shard_padding_size > 0:
                 B, H, Q, K = attention_mask.shape
@@ -3091,15 +3192,11 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                 # Scheduler step (all ranks compute locally in CFG parallel)
                 latents = self.scheduler.step(pred, t, latents, **_scheduler_step_extra_kwargs, return_dict=False)[0]
                 if i != len(timesteps) - 1 and should_compute:
-                    offset = model_kwargs.get("ar_kv_reuse_offset", 0)
                     model_kwargs = self.model._update_model_kwargs_for_generation(  # noqa
                         model_output,
                         model_kwargs,
                     )
-                    if input_ids.shape[1] != model_kwargs["position_ids"].shape[1]:
-                        # Select using relative positions
-                        index = model_kwargs["position_ids"] - offset
-                        input_ids = torch.gather(input_ids, 1, index=index)
+                    input_ids = None
                     attention_mask = model_kwargs.get("attention_mask")
                     b, _, q_len1, seq_len = attention_mask.shape
                     query_lens = [q_len1] * b

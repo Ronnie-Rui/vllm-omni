@@ -23,6 +23,7 @@ import torch
 import torch.distributed
 import torch.nn as nn
 import torch.nn.functional as F
+from cache_dit import ForwardPattern
 from diffusers.models.embeddings import PixArtAlphaCombinedTimestepSizeEmbeddings, PixArtAlphaTextProjection
 from diffusers.utils import (
     BaseOutput,
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
@@ -62,18 +64,35 @@ def _make_rms_norm(hidden_size: int, *, eps: float, elementwise_affine: bool) ->
         kwargs["has_weight"] = elementwise_affine
     elif not elementwise_affine:
         raise TypeError("RMSNorm backend does not support disabling affine weights.")
-    return RMSNorm(hidden_size, **kwargs)
+    norm = RMSNorm(hidden_size, **kwargs)
+    weight = getattr(norm, "weight", None)
+    if (
+        not elementwise_affine
+        and isinstance(weight, torch.Tensor)
+        and not isinstance(weight, nn.Parameter)
+        and "weight" not in dict(norm.named_buffers())
+    ):
+        delattr(norm, "weight")
+        norm.register_buffer("weight", weight, persistent=False)
+    return norm
 
 
 def apply_interleaved_rotary_emb(x: torch.Tensor, freqs: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
     cos, sin = freqs
-    x_real, x_imag = x.unflatten(2, (-1, 2)).unbind(-1)  # [B, S, C // 2]
+    # Concrete pair count instead of -1 keeps SDPA shape static under torch.compile.
+    x_real, x_imag = x.unflatten(2, (x.shape[2] // 2, 2)).unbind(-1)  # [B, S, C // 2]
     x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(2)
     out = (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
     return out
 
 
-def apply_split_rotary_emb(x: torch.Tensor, freqs: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+def apply_split_rotary_emb(
+    x: torch.Tensor,
+    freqs: tuple[torch.Tensor, torch.Tensor],
+    *,
+    head_dim: int,
+) -> torch.Tensor:
+    # `head_dim` is plumbed in (not inferred via `-1`) so SDPA shape stays static under torch.compile.
     cos, sin = freqs
 
     x_dtype = x.dtype
@@ -83,7 +102,7 @@ def apply_split_rotary_emb(x: torch.Tensor, freqs: tuple[torch.Tensor, torch.Ten
         # The cos/sin batch dim may only be broadcastable, so take batch size from x
         b = x.shape[0]
         _, h, t, _ = cos.shape
-        x = x.reshape(b, t, h, -1).swapaxes(1, 2)
+        x = x.reshape(b, t, h, head_dim).swapaxes(1, 2)
         needs_reshape = True
 
     # Split last dim (2*r) into (d=2, r)
@@ -110,7 +129,7 @@ def apply_split_rotary_emb(x: torch.Tensor, freqs: tuple[torch.Tensor, torch.Ten
     out = out.reshape(*out.shape[:-2], last)
 
     if needs_reshape:
-        out = out.swapaxes(1, 2).reshape(b, t, -1)
+        out = out.swapaxes(1, 2).reshape(b, t, h * head_dim)
 
     out = out.to(dtype=x_dtype)
     return out
@@ -488,12 +507,14 @@ class LTX2AudioVideoAttnProcessor:
                     key, key_rotary_emb if key_rotary_emb is not None else query_rotary_emb
                 )
             elif attn.rope_type == "split":
-                query = apply_split_rotary_emb(query, query_rotary_emb)
-                key = apply_split_rotary_emb(key, key_rotary_emb if key_rotary_emb is not None else query_rotary_emb)
+                query = apply_split_rotary_emb(query, query_rotary_emb, head_dim=attn.head_dim)
+                key = apply_split_rotary_emb(
+                    key, key_rotary_emb if key_rotary_emb is not None else query_rotary_emb, head_dim=attn.head_dim
+                )
 
-        query = query.unflatten(2, (attn.heads, -1))
-        key = key.unflatten(2, (attn.heads, -1))
-        value = value.unflatten(2, (attn.heads, -1))
+        query = query.unflatten(2, (attn.heads, attn.head_dim))
+        key = key.unflatten(2, (attn.heads, attn.head_dim))
+        value = value.unflatten(2, (attn.heads, attn.head_dim))
 
         attn_metadata = AttentionMetadata(attn_mask=attention_mask) if attention_mask is not None else None
         hidden_states = attn.attn(query, key, value, attn_metadata)
@@ -502,7 +523,7 @@ class LTX2AudioVideoAttnProcessor:
 
         # LTX-2.3: per-head gated attention
         if attn.to_gate_logits is not None:
-            hidden_states = hidden_states.unflatten(2, (attn.heads, -1))  # [B, T, H, D]
+            hidden_states = hidden_states.unflatten(2, (attn.heads, attn.head_dim))  # [B, T, H, D]
             # 2.0 * sigmoid so zero-init gates produce 1.0 (identity)
             gates = 2.0 * torch.sigmoid(gate_logits)  # [B, T, H]
             hidden_states = hidden_states * gates.unsqueeze(-1)
@@ -672,7 +693,7 @@ class LTX2Attention(torch.nn.Module):
         # LTX-2.3: per-head gated attention
         # leave unquantized for this linear
         if apply_gated_attention:
-            self.to_gate_logits = nn.Linear(query_dim, heads, bias=True)
+            self.to_gate_logits = nn.Linear(query_dim, self.query_num_heads, bias=True)
         else:
             self.to_gate_logits = None
 
@@ -1391,9 +1412,11 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
             # Reshape freqs to be compatible with multi-head attention
             b = cos_freq.shape[0]
             t = cos_freq.shape[1]
+            # Concrete per-head dim instead of -1 — see apply_split_rotary_emb
+            r = self.dim // self.num_attention_heads // 2
 
-            cos_freq = cos_freq.reshape(b, t, self.num_attention_heads, -1)
-            sin_freq = sin_freq.reshape(b, t, self.num_attention_heads, -1)
+            cos_freq = cos_freq.reshape(b, t, self.num_attention_heads, r)
+            sin_freq = sin_freq.reshape(b, t, self.num_attention_heads, r)
 
             cos_freqs = torch.swapaxes(cos_freq, 1, 2)  # (B,H,T,D//2)
             sin_freqs = torch.swapaxes(sin_freq, 1, 2)  # (B,H,T,D//2)
@@ -1427,6 +1450,14 @@ class LTX2VideoTransformer3DModel(nn.Module):
         qk_norm (`str`, defaults to `"rms_norm_across_heads"`):
             The normalization layer to use.
     """
+
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "transformer_blocks": ForwardPattern.Pattern_0,
+        },
+        has_separate_cfg=True,
+        check_forward_pattern=False,
+    )
 
     _supports_gradient_checkpointing = True
     _skip_layerwise_casting_patterns = ["norm"]
@@ -1939,10 +1970,6 @@ class LTX2VideoTransformer3DModel(nn.Module):
         # 5. Run transformer blocks
         for block in self.transformer_blocks:
             block_kwargs = {
-                "hidden_states": hidden_states,
-                "audio_hidden_states": audio_hidden_states,
-                "encoder_hidden_states": encoder_hidden_states,
-                "audio_encoder_hidden_states": audio_encoder_hidden_states,
                 "temb": temb,
                 "temb_audio": temb_audio,
                 "temb_ca_scale_shift": video_cross_attn_scale_shift,
@@ -1958,11 +1985,27 @@ class LTX2VideoTransformer3DModel(nn.Module):
                 "encoder_attention_mask": encoder_attention_mask,
                 "audio_encoder_attention_mask": audio_encoder_attention_mask,
             }
+            # NOTE: We intentionally pass the first 4 args here positionally,
+            # because CacheDiT expects the first 2 args to be hidden_states
+            # and encoder_hidden_states, so passing them as kwargs will cause
+            # positional / keywords arg collisions.
             if torch.is_grad_enabled() and self.gradient_checkpointing:
-                hidden_states, audio_hidden_states = self._gradient_checkpointing_func(block, **block_kwargs)
+                hidden_states, audio_hidden_states = self._gradient_checkpointing_func(
+                    block,
+                    hidden_states,
+                    audio_hidden_states,
+                    encoder_hidden_states,
+                    audio_encoder_hidden_states,
+                    **block_kwargs,
+                )
             else:
-                hidden_states, audio_hidden_states = block(**block_kwargs)
-
+                hidden_states, audio_hidden_states = block(
+                    hidden_states,
+                    audio_hidden_states,
+                    encoder_hidden_states,
+                    audio_encoder_hidden_states,
+                    **block_kwargs,
+                )
         # 6. Output layers (including unpatchification)
         scale_shift_values = self.scale_shift_table[None, None] + embedded_timestep[:, :, None]
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
