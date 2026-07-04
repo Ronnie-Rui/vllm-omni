@@ -215,6 +215,7 @@ Enable async_chunk in stage configuration YAML:
 
 ```yaml
 async_chunk: true
+async_chunk_timeout_s: 30.0  # Optional: fail requests waiting >30s for chunks
 stage_args:
   - stage_id: 0
     engine_args:
@@ -227,6 +228,7 @@ stage_args:
 ### Stage Configuration
 
 - `async_chunk: bool`: Enable/disable async chunk mode
+- `async_chunk_timeout_s: float | None`: Optional timeout (in seconds) for downstream stages waiting for upstream chunks. When unset (default: `None`), requests can wait indefinitely. When set to a positive value, requests that wait longer than the specified duration are failed with `FINISHED_ERROR` status. This prevents requests from getting stuck when upstream chunks are delayed or never produced. Example: `async_chunk_timeout_s: 30.0` fails requests waiting more than 30 seconds. Can also be set via CLI: `--async-chunk-timeout-s 30.0`.
 - `custom_process_next_stage_input_func: str`: Path to custom chunk processing function; receives `(transfer_manager, pooling_output, request)`. For qwen3-omni: `thinker2talker_async_chunk`, `talker2code2wav_async_chunk`
 - `stage_connector_config: dict`: Connector configuration
 - `worker_type: str`: Model type, e.g. `"ar"` or `"generation"` (used by OmniChunkTransferAdapter for mode-specific payload handling)

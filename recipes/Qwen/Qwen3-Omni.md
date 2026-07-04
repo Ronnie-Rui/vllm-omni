@@ -62,6 +62,10 @@ Prefer CLI overrides for day-to-day tuning:
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
   --no-async-chunk
 
+# Set async chunk timeout to fail stuck requests after 30 seconds
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+  --async-chunk-timeout-s 30.0
+
 # Example per-stage tuning in unified launch
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
   --stage-overrides '{"1": {"gpu_memory_utilization": 0.5}}'
@@ -245,3 +249,9 @@ vllm bench serve \
 - `/v1/realtime` is unsupported while `async_chunk` is enabled.
 - The default deploy uses `SharedMemoryConnector`; this is for single-host
   stage wiring.
+- `async_chunk_timeout_s`: Optional timeout guard for async chunk waits. When
+  unset (default), requests can wait indefinitely for upstream chunks. Set via
+  `--async-chunk-timeout-s <seconds>` (CLI) or `async_chunk_timeout_s: <value>`
+  (deploy YAML) to fail requests that wait longer than the specified duration.
+  Useful for preventing stuck requests when upstream chunks are delayed or lost.
+  Example: `--async-chunk-timeout-s 30.0` fails requests waiting >30 seconds.

@@ -13,6 +13,7 @@ The new deploy schema lives under `vllm_omni/deploy/` and is paired with a froze
 |-------|------|----------|---------|-------------|
 | `base_config` | str (path) | optional | — | Overlay parent (relative or absolute). `stages:` / `platforms:` deep-merged by stage_id; other scalars overlay-wins. Intended for user-authored overlays; prod yamls stay flat. |
 | `async_chunk` | bool | optional | `true` | Enable chunked streaming between stages. Pin to `false` if the pipeline runs end-to-end. |
+| `async_chunk_timeout_s` | float \| null | optional | `null` | Optional timeout (in seconds) for downstream stages waiting for upstream chunks. When unset (default), requests can wait indefinitely. When set to a positive value, requests that wait longer than the specified duration are failed with `FINISHED_ERROR` status. Prevents stuck requests when upstream chunks are delayed or lost. Example: `async_chunk_timeout_s: 30.0`. |
 | `connectors` | dict | optional | `null` | Named connector specs (`{name, extra}`). Referenced by each stage's `input_connectors` / `output_connectors`. See [Connector schema](#connector-schema). |
 | `edges` | list | optional | `null` | Explicit edge list for the KV transfer graph. Auto-derived from stage inputs if omitted. |
 | `stages` | list | required | — | Per-stage engine args + wiring (see [Stage fields](#stage-fields)). |
@@ -89,6 +90,7 @@ stages:
 | `--deploy-config PATH` | Load a new-schema deploy YAML. Takes precedence over `--stage-configs-path`. **Optional** — when omitted, the bundled `vllm_omni/deploy/<model_type>.yaml` is auto-loaded by the model registry. |
 | `--stage-overrides JSON` | Per-stage JSON overrides, e.g. `'{"0":{"gpu_memory_utilization":0.5}}'`. Per-stage values always win over global flags. |
 | `--async-chunk` / `--no-async-chunk` | Flip the deploy YAML's `async_chunk:` bool. Unset (default) leaves the YAML value in force. |
+| `--async-chunk-timeout-s SECONDS` | Set the async chunk timeout in seconds. Fails downstream requests that wait longer than the specified duration for upstream chunks. Unset (default) preserves the no-timeout behavior. Example: `--async-chunk-timeout-s 30.0`. |
 | `--stage-configs-path` | **Deprecated.** Accepts legacy `stage_args` yamls and (auto-detected) new deploy yamls; emits a deprecation warning. Migrate to `--deploy-config`. To be removed in a follow-up PR. |
 
 ### Stage-Based CLI Paradigm
