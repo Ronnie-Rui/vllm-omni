@@ -655,6 +655,16 @@ class TestPipelineRegistration:
         assert isinstance(pipeline_cfg, PipelineConfig)
         assert pipeline_cfg.model_type == resolved_type
 
+    def test_resolve_when_autodetect_resolves_none(self):
+        """Regression test for: https://github.com/vllm-project/vllm-omni/issues/4726"""
+        deploy_path = get_deploy_config_path("ming_tts.yaml")
+        resolved_config = StageConfigFactory.create_from_model(
+            model="inclusionAI/Ming-omni-tts-0.5B",
+            deploy_config_path=deploy_path,
+        )
+        assert resolved_config is not None
+        assert len(resolved_config) > 0
+
 
 class TestResolveScheduler:
     def test_all_execution_types_handled(self):
@@ -1050,7 +1060,11 @@ class TestQwen2_5OmniPipeline:
         assert isinstance(s, StagePipelineConfig)
         assert s.input_sources == (0,)
         assert s.sampling_constraints["stop_token_ids"] == [8294]
-        assert s.custom_process_input_func is not None
+        # thinker2talker was removed: qwen2_5_omni has no async_chunk support,
+        # so sync_process_input_func always wins and custom_process_input_func
+        # was dead code.
+        assert s.custom_process_input_func is None
+        assert s.sync_process_input_func is not None
 
     def test_code2wav(self):
         p = StageConfigFactory.resolve_pipeline_config("qwen2_5_omni")
@@ -1181,10 +1195,14 @@ class TestMingFlashOmniPipeline:
         # Per-stage model_arch override (Ming talker has its own self-contained LLM)
         assert s.model_arch == "MingFlashOmniTalkerForConditionalGeneration"
         assert s.tokenizer_subdir == "talker/llm"
-        assert s.custom_process_input_func is not None
+        # thinker2talker was removed: ming_flash_omni has no async_chunk support
+        # and both thinker2talker / thinker2talker_token_only called _build_talker_inputs
+        # identically, so custom_process_input_func was dead code.
+        assert s.custom_process_input_func is None
+        assert s.sync_process_input_func is not None
 
     def test_talker_stage_processor_wiring_resolves(self):
-        """The custom_process_input_func string must point to a real callable.
+        """The sync_process_input_func string must point to a real callable.
 
         Lazy string references only fail at first inference otherwise — this
         catches typos in the pipeline declaration at import / registration time.
@@ -1194,7 +1212,7 @@ class TestMingFlashOmniPipeline:
 
         s = p.get_stage(1)
         assert isinstance(s, StagePipelineConfig)
-        module_path, _, attr = s.custom_process_input_func.rpartition(".")
+        module_path, _, attr = s.sync_process_input_func.rpartition(".")
         module = importlib.import_module(module_path)
         assert callable(getattr(module, attr))
 
@@ -1570,6 +1588,197 @@ class TestAuraOmniDeploy:
         assert stages[3].yaml_engine_args["model_arch"] == "Qwen3TTSCode2Wav"
 
 
+class TestDeployCliOverrideFlow:
+    """Test deploy-YAML baselines overridden by CLI runtime overrides."""
+
+    def test_diffusion_deploy_fields_can_be_overridden_by_cli(self, tmp_path):
+        deploy_path = tmp_path / "diffusion_stage.yaml"
+        deploy_path.write_text(
+            """
+async_chunk: false
+stages:
+  - stage_id: 0
+    devices: "4,5"
+    parallel_config:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 1
+      enable_expert_parallel: false
+      sequence_parallel_size: 1
+      ulysses_degree: 1
+      ring_degree: 1
+      cfg_parallel_size: 1
+      vae_patch_parallel_size: 1
+      use_hsdp: false
+      hsdp_shard_size: -1
+      hsdp_replicate_size: 1
+    engine_args:
+      cache_backend: cache_dit
+      diffusion_attention_backend: FLASH_ATTN
+      diffusion_kv_cache_dtype: auto
+      step_execution: false
+      vae_use_tiling: false
+      enable_cpu_offload: false
+      max_generated_image_size: 1048576
+      tts_max_instructions_length: 1000
+""",
+            encoding="utf-8",
+        )
+
+        pipeline = PipelineConfig(
+            model_type="test_diffusion",
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="dit",
+                    execution_type=StageExecutionType.DIFFUSION,
+                    final_output=True,
+                    final_output_type="image",
+                ),
+            ),
+        )
+        deploy = load_deploy_config(deploy_path)
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        stage = stages[0]
+
+        assert stage.yaml_engine_args["parallel_config"]["pipeline_parallel_size"] == 1
+        assert stage.yaml_engine_args["parallel_config"]["data_parallel_size"] == 1
+        assert stage.yaml_engine_args["parallel_config"]["tensor_parallel_size"] == 1
+        assert stage.yaml_engine_args["parallel_config"]["enable_expert_parallel"] is False
+        assert stage.yaml_engine_args["parallel_config"]["sequence_parallel_size"] == 1
+        assert stage.yaml_engine_args["parallel_config"]["ulysses_degree"] == 1
+        assert stage.yaml_engine_args["parallel_config"]["ring_degree"] == 1
+        assert stage.yaml_engine_args["parallel_config"]["cfg_parallel_size"] == 1
+        assert stage.yaml_engine_args["parallel_config"]["vae_patch_parallel_size"] == 1
+        assert stage.yaml_engine_args["cache_backend"] == "cache_dit"
+        assert stage.yaml_engine_args["parallel_config"]["use_hsdp"] is False
+        assert stage.yaml_engine_args["parallel_config"]["hsdp_shard_size"] == -1
+        assert stage.yaml_engine_args["parallel_config"]["hsdp_replicate_size"] == 1
+        assert stage.yaml_engine_args["diffusion_attention_backend"] == "FLASH_ATTN"
+        assert stage.yaml_engine_args["diffusion_kv_cache_dtype"] == "auto"
+        assert stage.yaml_engine_args["step_execution"] is False
+        assert stage.yaml_engine_args["vae_use_tiling"] is False
+        assert stage.yaml_engine_args["enable_cpu_offload"] is False
+        assert stage.yaml_engine_args["max_generated_image_size"] == 1048576
+        assert stage.yaml_engine_args["tts_max_instructions_length"] == 1000
+
+        stage.runtime_overrides = StageConfigFactory._merge_cli_overrides(
+            stage,
+            {
+                "pipeline_parallel_size": 2,
+                "data_parallel_size": 3,
+                "tensor_parallel_size": 4,
+                "enable_expert_parallel": True,
+                "sequence_parallel_size": 24,
+                "ulysses_degree": 2,
+                "ring_degree": 4,
+                "cfg_parallel_size": 2,
+                "vae_patch_parallel_size": 2,
+                "cache_backend": "tea_cache",
+                "use_hsdp": True,
+                "hsdp_shard_size": 8,
+                "hsdp_replicate_size": 2,
+                "diffusion_attention_backend": "SAGE_ATTN",
+                "diffusion_kv_cache_dtype": "fp8",
+                "step_execution": True,
+                "vae_use_tiling": True,
+                "enable_cpu_offload": True,
+                "max_generated_image_size": 2097152,
+                "tts_max_instructions_length": 2000,
+            },
+        )
+
+        omega_config = stage.to_omegaconf()
+
+        assert omega_config.engine_args.cache_backend == "tea_cache"
+        assert omega_config.engine_args.diffusion_attention_backend == "SAGE_ATTN"
+        assert omega_config.engine_args.diffusion_kv_cache_dtype == "fp8"
+        assert omega_config.engine_args.step_execution is True
+        assert omega_config.engine_args.vae_use_tiling is True
+        assert omega_config.engine_args.enable_cpu_offload is True
+        assert omega_config.engine_args.max_generated_image_size == 2097152
+        assert omega_config.engine_args.tts_max_instructions_length == 2000
+        assert omega_config.engine_args.parallel_config.pipeline_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.data_parallel_size == 3
+        assert omega_config.engine_args.parallel_config.tensor_parallel_size == 4
+        assert omega_config.engine_args.parallel_config.enable_expert_parallel is True
+        assert omega_config.engine_args.parallel_config.sequence_parallel_size == 24
+        assert omega_config.engine_args.parallel_config.ulysses_degree == 2
+        assert omega_config.engine_args.parallel_config.ring_degree == 4
+        assert omega_config.engine_args.parallel_config.cfg_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.vae_patch_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.use_hsdp is True
+        assert omega_config.engine_args.parallel_config.hsdp_shard_size == 8
+        assert omega_config.engine_args.parallel_config.hsdp_replicate_size == 2
+
+    def test_llm_deploy_fields_can_be_overridden_by_cli(self, tmp_path):
+        deploy_path = tmp_path / "llm_stage.yaml"
+        deploy_path.write_text(
+            """
+async_chunk: false
+stages:
+  - stage_id: 0
+    devices: "0,1"
+    engine_args:
+      tensor_parallel_size: 1
+      enable_expert_parallel: false
+      gpu_memory_utilization: 0.5
+      max_num_seqs: 16
+      max_num_batched_tokens: 1024
+      max_model_len: 4096
+      enforce_eager: false
+""",
+            encoding="utf-8",
+        )
+
+        pipeline = PipelineConfig(
+            model_type="test_llm",
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="thinker",
+                    execution_type=StageExecutionType.LLM_AR,
+                    final_output=True,
+                    final_output_type="text",
+                ),
+            ),
+        )
+        deploy = load_deploy_config(deploy_path)
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        stage = stages[0]
+
+        assert stage.yaml_engine_args["tensor_parallel_size"] == 1
+        assert stage.yaml_engine_args["enable_expert_parallel"] is False
+        assert stage.yaml_engine_args["gpu_memory_utilization"] == 0.5
+        assert stage.yaml_engine_args["max_num_seqs"] == 16
+        assert stage.yaml_engine_args["max_num_batched_tokens"] == 1024
+        assert stage.yaml_engine_args["max_model_len"] == 4096
+        assert stage.yaml_engine_args["enforce_eager"] is False
+
+        stage.runtime_overrides = StageConfigFactory._merge_cli_overrides(
+            stage,
+            {
+                "tensor_parallel_size": 2,
+                "enable_expert_parallel": True,
+                "gpu_memory_utilization": 0.9,
+                "max_num_seqs": 32,
+                "max_num_batched_tokens": 2048,
+                "max_model_len": 8192,
+                "enforce_eager": True,
+            },
+        )
+
+        omega_config = stage.to_omegaconf()
+
+        assert omega_config.engine_args.tensor_parallel_size == 2
+        assert omega_config.engine_args.enable_expert_parallel is True
+        assert omega_config.engine_args.gpu_memory_utilization == 0.9
+        assert omega_config.engine_args.max_num_seqs == 32
+        assert omega_config.engine_args.max_num_batched_tokens == 2048
+        assert omega_config.engine_args.max_model_len == 8192
+        assert omega_config.engine_args.enforce_eager is True
+
+
 class TestSentinelDefaultPrecedence:
     """Caller-typed (non-None) values win over YAML; None values fall through
     to YAML / dataclass defaults (#3035)."""
@@ -1710,11 +1919,12 @@ class TestSentinelDefaultPrecedence:
         )
 
     def test_ming_flash_omni_topology(self):
-        """Guard ming_flash_omni's PR3 cleanup: stage 0 has no full-payload
-        producer hook (the connector path was removed as fake -- arch is not
-        in ``_FULL_PAYLOAD_INPUT_STAGES``), and stage 1 still wires the
-        legacy ``thinker2talker`` (custom_process_input_func) plus the
-        ``thinker2talker_token_only`` placeholder (sync_process_input_func).
+        """Guard ming_flash_omni's SIP cleanup: stage 0 has no full-payload
+        producer hook (arch is not in ``_FULL_PAYLOAD_INPUT_STAGES``), and
+        stage 1 uses only ``thinker2talker_token_only`` (sync_process_input_func).
+        The dead ``thinker2talker`` (custom_process_input_func) was removed
+        because ming_flash_omni has no async_chunk support and both functions
+        called ``_build_talker_inputs`` identically.
         Merge under either async_chunk mode must not re-introduce a
         stage-0 full-payload hook."""
         pipeline = StageConfigFactory.resolve_pipeline_config("ming_flash_omni")
@@ -1725,8 +1935,7 @@ class TestSentinelDefaultPrecedence:
             "ming_flash_omni stage 0 must not declare a full-payload producer "
             "(connector path is not active for this arch)."
         )
-        assert stage1.custom_process_input_func is not None
-        assert stage1.custom_process_input_func.endswith("thinker2talker")
+        assert stage1.custom_process_input_func is None
         assert stage1.sync_process_input_func is not None
         assert stage1.sync_process_input_func.endswith("thinker2talker_token_only")
 
