@@ -12,7 +12,7 @@ from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine import FinishReason
 
 from vllm_omni.engine.output_modality import OutputModalityNames
-from vllm_omni.engine.output_processor import OmniRequestState
+from vllm_omni.engine.output_processor import MultimodalOutputProcessor, OmniRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -268,6 +268,18 @@ def test_no_detokenizer_make_request_output_with_routed_experts():
     assert result is not None
     assert not isinstance(result, PoolingRequestOutput)
     assert result.outputs[0].routed_experts is routed_experts
+
+
+def test_request_output_can_carry_internal_kv_cache_metrics():
+    s = _make_no_detok_state(RequestOutputKind.CUMULATIVE)
+    s.add_multimodal_tensor(torch.randn(10), mm_type=AUDIO)
+    result = s.make_request_output([], None, FinishReason.STOP, None)
+    payload = {"seq_len": 32, "block_ids": [1, 2], "source": "kv_cache_manager"}
+
+    MultimodalOutputProcessor._attach_kv_cache_metrics(result, payload)
+
+    assert getattr(result, "_omni_kv_cache_metrics") == payload
+    assert getattr(result.outputs[0], "_omni_kv_cache_metrics", None) is None
 
 
 def test_no_detokenizer_stream_interval_skipped():

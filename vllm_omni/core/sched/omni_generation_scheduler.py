@@ -503,6 +503,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             status_before_stop = request.status
             finish_reason = None
             routed_experts = None
+            kv_cache_metrics: dict[str, Any] | None = None
+            kv_cache_metrics_collected = False
 
             # Diffusion request: completes in one step; mark finished and free resources
             if (
@@ -530,6 +532,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     if self.chunk_transfer_adapter:
                         self.chunk_transfer_adapter.segment_finished_requests.discard(req_id)
                 if finished:
+                    kv_cache_metrics = self._build_kv_cache_metrics_payload(request)
+                    kv_cache_metrics_collected = True
                     kv_transfer_params = self._free_request(request)
                     if self.chunk_transfer_adapter is not None:
                         self.chunk_transfer_adapter.cleanup(
@@ -561,6 +565,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
+                if not kv_cache_metrics_collected:
+                    kv_cache_metrics = self._build_kv_cache_metrics_payload(request)
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     OmniEngineCoreOutput(
@@ -578,6 +584,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        kv_cache_metrics=kv_cache_metrics,
                     )
                 )
             else:
@@ -591,6 +598,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 continue
             request.status = RequestStatus.FINISHED_STOPPED
             finish_reason = request.get_finished_reason()
+            kv_cache_metrics = self._build_kv_cache_metrics_payload(request)
             finished = self._handle_stopped_request(request)
             kv_transfer_params = None
             if finished:
@@ -609,6 +617,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     events=request.take_events(),
                     kv_transfer_params=kv_transfer_params,
                     trace_headers=request.trace_headers,
+                    kv_cache_metrics=kv_cache_metrics,
                 )
             )
             stopped_running_reqs.add(request)

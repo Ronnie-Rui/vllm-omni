@@ -121,6 +121,18 @@ GENERATION_TOKENS = METRIC_PREFIX + "generation_tokens"
 
 
 # ============================================================================
+# KV cache efficiency family (per-stage + per-replica LLM stages)
+# ============================================================================
+KV_FOOTPRINT_TOKENS = METRIC_PREFIX + "kv_footprint_tokens"
+KV_FOOTPRINT_BYTES = METRIC_PREFIX + "kv_footprint_bytes"
+KV_BLOCK_OCCUPANCY_RATIO = METRIC_PREFIX + "kv_block_occupancy_ratio"
+KV_TAIL_WASTE_TOKENS = METRIC_PREFIX + "kv_tail_waste_tokens"
+KV_FRAGMENTATION_RATIO = METRIC_PREFIX + "kv_fragmentation_ratio"
+KV_CACHED_TOKENS = METRIC_PREFIX + "kv_cached_tokens"
+KV_PREFIX_HIT_RATIO = METRIC_PREFIX + "kv_prefix_hit_ratio"
+
+
+# ============================================================================
 # Audio family (per-stage + per-replica audio path metrics)
 # ============================================================================
 AUDIO_TTFP_S = METRIC_PREFIX + AUDIO_TTFP + "_s"
@@ -171,6 +183,11 @@ TRANSFER_LABELS = (
     "to_stage",
     "to_replica",
 )
+
+# KV cache efficiency label set. ``source`` distinguishes allocator-backed
+# observations from fallback estimates, and ``modality`` keeps text/audio/image
+# stage profiles separate without high-cardinality request labels.
+KV_LABELS = ("model_name", "stage", "replica", "modality", "source")
 
 
 # ============================================================================
@@ -226,6 +243,12 @@ RTF_BUCKETS = (
     5.0,
     10.0,
 )
+
+# Buckets for ratio histograms: occupancy, fragmentation, and prefix-hit.
+RATIO_BUCKETS = (0.0, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1.0)
+
+# Buckets for per-stage KV tail-waste token histograms.
+TOKENS_BUCKETS = (0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
 
 # Bytes bucket for transfer payload size.
 BYTES_BUCKETS = (

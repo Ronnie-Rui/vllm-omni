@@ -61,6 +61,7 @@ class StageRequestStats:
     vllm_tpot_ms: float = 0.0
     vllm_itl_ms: float = 0.0
     vllm_itls_ms: list[float] | None = None
+    kv_snapshot: Any | None = None
 
     @property
     def rx_mbps(self) -> float:
@@ -122,6 +123,7 @@ STAGE_EXCLUDE = {
     "rx_in_flight_time_ms",
     "final_output_type",
     "pipeline_timings",
+    "kv_snapshot",
 }
 TRANSFER_EXCLUDE = {"from_stage", "to_stage", "request_id", "used_shm"}
 E2E_EXCLUDE = {"request_id"}

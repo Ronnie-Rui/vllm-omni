@@ -21,6 +21,7 @@ from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import coerce_param_message_types, get_final_stage_id_for_e2e
 from vllm_omni.errors import raise_client_error_or
+from vllm_omni.metrics.kv import OmniKVCacheMetrics, observe_kv_at_stage_metrics
 from vllm_omni.metrics.modality import OmniModalityMetrics, observe_modality_at_finalize
 from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
 from vllm_omni.metrics.stats import OrchestratorAggregator
@@ -193,6 +194,7 @@ class OmniBase(PDDisaggregationMixin):
         self._consumed_metric_messages: dict[str, set[int]] = {}
         self.prom_metrics = OmniPrometheusMetrics(model_name=model, log_stats=log_stats)
         self.mod_metrics = OmniModalityMetrics(model_name=model, log_stats=log_stats)
+        self.kv_metrics = OmniKVCacheMetrics(model_name=model, log_stats=log_stats)
 
         self.default_sampling_params_list = self.engine.default_sampling_params_list
         if not self.output_modalities:
@@ -358,6 +360,13 @@ class OmniBase(PDDisaggregationMixin):
         stage_id = msg.stage_id
         stage_meta = self.engine.get_stage_metadata(stage_id)
         req_state.metrics.on_stage_metrics(stage_id, req_id, _m, stage_meta.final_output_type)
+        observe_kv_at_stage_metrics(
+            self.kv_metrics,
+            stage_id=stage_id,
+            replica_id=getattr(msg, "replica_id", None),
+            stage_metrics=_m,
+            modality=stage_meta.final_output_type,
+        )
         submit_ts = msg.stage_submit_ts
         now = time.time()
         if req_state.metrics.stage_first_ts[stage_id] is None:
@@ -409,6 +418,13 @@ class OmniBase(PDDisaggregationMixin):
             consumed = self._consumed_metric_message_ids(req_id)
             if msg_id not in consumed:
                 req_state.metrics.on_stage_metrics(stage_id, req_id, msg.metrics, output_type)
+                observe_kv_at_stage_metrics(
+                    self.kv_metrics,
+                    stage_id=stage_id,
+                    replica_id=msg.replica_id,
+                    stage_metrics=msg.metrics,
+                    modality=output_type,
+                )
                 submit_ts = msg.stage_submit_ts
                 now = time.time()
                 if req_state.metrics.stage_first_ts[stage_id] is None:
@@ -518,6 +534,13 @@ class OmniBase(PDDisaggregationMixin):
             consumed = self._consumed_metric_message_ids(req_id)
             if msg_id not in consumed:
                 metrics.on_stage_metrics(stage_id, req_id, _m, output_type)
+                observe_kv_at_stage_metrics(
+                    self.kv_metrics,
+                    stage_id=stage_id,
+                    replica_id=result.replica_id,
+                    stage_metrics=_m,
+                    modality=output_type,
+                )
                 consumed.add(msg_id)
 
         if not stage_meta.final_output:

@@ -411,6 +411,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             status_before_stop = request.status
             finish_reason = None
             routed_experts = None
+            kv_cache_metrics: dict[str, Any] | None = None
+            kv_cache_metrics_collected = False
 
             # Check for stop and update request status.
             if new_token_ids:
@@ -461,6 +463,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     request.spec_token_ids = []
                     request._output_token_ids.clear()
                 if finished:
+                    kv_cache_metrics = self._build_kv_cache_metrics_payload(request)
+                    kv_cache_metrics_collected = True
                     kv_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
@@ -482,6 +486,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
+                if not kv_cache_metrics_collected:
+                    kv_cache_metrics = self._build_kv_cache_metrics_payload(request)
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     OmniEngineCoreOutput(
@@ -501,6 +507,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         num_nans_in_logits=request.num_nans_in_logits,
                         is_segment_finished=is_segment_finished,
                         new_prompt_len_snapshot=self._new_prompt_len_snapshot.get(req_id, None),
+                        kv_cache_metrics=kv_cache_metrics,
                     )
                 )
             else:

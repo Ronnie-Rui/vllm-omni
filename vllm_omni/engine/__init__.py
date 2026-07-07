@@ -125,6 +125,8 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     is_segment_finished: bool | None = False
     # Streaming update prompt length
     new_prompt_len_snapshot: int | None = None
+    # Internal KV efficiency payload consumed by StagePool metrics.
+    kv_cache_metrics: dict[str, Any] | None = None
 
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):

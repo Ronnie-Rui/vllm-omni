@@ -512,6 +512,23 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
     def pop_native_text_metrics(self, request_id: str) -> dict[str, Any]:
         return self._native_text_metrics_by_request.pop(request_id, {})
 
+    @staticmethod
+    def _attach_kv_cache_metrics(request_output: Any, kv_cache_metrics: Any) -> None:
+        if request_output is None or not isinstance(kv_cache_metrics, dict):
+            return
+        setattr(request_output, "_omni_kv_cache_metrics", dict(kv_cache_metrics))
+
+    def _attach_kv_cache_metrics_to_outputs(
+        self,
+        processor_output: OutputProcessorOutput,
+        kv_metrics_by_external_req_id: dict[str, dict[str, Any]],
+    ) -> None:
+        if not kv_metrics_by_external_req_id:
+            return
+        for request_output in getattr(processor_output, "request_outputs", None) or []:
+            payload = kv_metrics_by_external_req_id.get(getattr(request_output, "request_id", None))
+            self._attach_kv_cache_metrics(request_output, payload)
+
     def abort_requests(self, request_ids, internal: bool) -> list[str]:
         request_ids = list(request_ids)
         for request_id in request_ids:
@@ -599,11 +616,15 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         # that would trigger upstream's `assert detokenizer is not None`.
         upstream_outputs: list[EngineCoreOutput] = []
         mm_only_outputs: list[EngineCoreOutput] = []
+        kv_metrics_by_external_req_id: dict[str, dict[str, Any]] = {}
 
         for eco in engine_core_outputs:
             req_state = self.request_states.get(eco.request_id)
             if req_state is None:
                 continue
+            kv_cache_metrics = getattr(eco, "kv_cache_metrics", None)
+            if isinstance(kv_cache_metrics, dict):
+                kv_metrics_by_external_req_id[req_state.external_req_id] = kv_cache_metrics
 
             # Accumulate multimodal tensors regardless of path.
             if isinstance(req_state, OmniRequestState):
@@ -623,11 +644,13 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         self._process_mm_only_outputs(mm_only_outputs)
 
         # Delegate text/pooling outputs to upstream.
-        return super().process_outputs(
+        processor_output = super().process_outputs(
             upstream_outputs,
             engine_core_timestamp=engine_core_timestamp,
             iteration_stats=iteration_stats,
         )
+        self._attach_kv_cache_metrics_to_outputs(processor_output, kv_metrics_by_external_req_id)
+        return processor_output
 
     def _process_mm_only_outputs(
         self,
@@ -647,6 +670,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             finish_reason = eco.finish_reason
             stop_reason = eco.stop_reason
             kv_transfer_params = eco.kv_transfer_params
+            kv_cache_metrics = getattr(eco, "kv_cache_metrics", None)
             routed_experts = eco.routed_experts
             req_state.num_cached_tokens = eco.num_cached_tokens
             req_state.is_prefilling = False
@@ -659,6 +683,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 kv_transfer_params,
                 routed_experts,
             ):
+                self._attach_kv_cache_metrics(request_output, kv_cache_metrics)
                 if req_state.queue is not None:
                     req_state.queue.put(request_output)
 

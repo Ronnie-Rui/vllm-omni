@@ -26,6 +26,12 @@ from vllm_omni.engine.stage_client import (
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.metrics import definitions as defs
+from vllm_omni.metrics.kv import (
+    compute_kv_efficiency,
+    estimate_kv_bytes_per_token,
+    normalize_kv_block_ids,
+    resolve_kv_block_size,
+)
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import count_tokens_from_outputs
@@ -95,6 +101,8 @@ class StagePool:
         self.clients: list[StagePoolClient | None] = list(normalized_clients)
         self._output_processor = output_processor
         self._stage_vllm_config = stage_vllm_config
+        self._kv_block_size = resolve_kv_block_size(stage_vllm_config)
+        self._kv_bytes_per_token = estimate_kv_bytes_per_token(stage_vllm_config)
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
         self._replica_metrics: list[_ReplicaMetrics] = [_ReplicaMetrics() for _ in self.clients]
@@ -521,6 +529,84 @@ class StagePool:
 
     # ---- Metrics ----
 
+    def _kv_sequence_tokens(self, request_outputs: list[Any], num_tokens_out: int) -> int:
+        prompt_tokens = 0
+        for ro in request_outputs:
+            prompt_token_ids = getattr(ro, "prompt_token_ids", None)
+            if prompt_token_ids is not None:
+                try:
+                    prompt_tokens += len(prompt_token_ids)
+                except TypeError:
+                    pass
+        return prompt_tokens + max(int(num_tokens_out or 0), 0)
+
+    def _cached_prompt_tokens(self, request_outputs: list[Any]) -> tuple[int, int]:
+        cached_tokens = 0
+        prompt_tokens = 0
+        for ro in request_outputs:
+            cached_tokens += self._coerce_int_scalar(getattr(ro, "num_cached_tokens", None))
+            prompt_token_ids = getattr(ro, "prompt_token_ids", None)
+            if prompt_token_ids is not None:
+                try:
+                    prompt_tokens += len(prompt_token_ids)
+                except TypeError:
+                    pass
+        return cached_tokens, prompt_tokens
+
+    def _kv_payload_from_scheduler(self, request_outputs: list[Any]) -> dict[str, Any] | None:
+        for ro in request_outputs:
+            payload = getattr(ro, "_omni_kv_cache_metrics", None)
+            if isinstance(payload, Mapping):
+                return dict(payload)
+        return None
+
+    def _kv_payload_from_transfer_params(self, request_outputs: list[Any]) -> dict[str, Any] | None:
+        for ro in request_outputs:
+            params = getattr(ro, "kv_transfer_params", None)
+            if not isinstance(params, Mapping):
+                continue
+            metadata = params.get("kv_metadata") or params.get("metadata")
+            if isinstance(metadata, Mapping):
+                return {
+                    "seq_len": metadata.get("seq_len"),
+                    "block_ids": metadata.get("block_ids"),
+                    "source": "kv_transfer_params",
+                }
+        return None
+
+    def _build_kv_snapshot(self, request_outputs: list[Any], num_tokens_out: int) -> Any | None:
+        if self.stage_type != "llm":
+            return None
+
+        fallback_sequence_tokens = self._kv_sequence_tokens(request_outputs, num_tokens_out)
+        cached_tokens, prompt_tokens = self._cached_prompt_tokens(request_outputs)
+        payload = self._kv_payload_from_scheduler(request_outputs) or self._kv_payload_from_transfer_params(
+            request_outputs
+        )
+
+        source = "stage_tokens"
+        sequence_tokens = fallback_sequence_tokens
+        allocated_blocks = None
+        if payload is not None:
+            source = str(payload.get("source") or source)
+            sequence_tokens = self._coerce_int_scalar(payload.get("seq_len")) or fallback_sequence_tokens
+            block_ids = normalize_kv_block_ids(payload.get("block_ids"))
+            if block_ids:
+                allocated_blocks = len(block_ids)
+
+        if sequence_tokens <= 0 and not allocated_blocks:
+            return None
+
+        return compute_kv_efficiency(
+            block_size=getattr(self, "_kv_block_size", 16),
+            sequence_tokens=sequence_tokens,
+            allocated_blocks=allocated_blocks,
+            bytes_per_token=getattr(self, "_kv_bytes_per_token", 0),
+            cached_tokens=cached_tokens,
+            prompt_tokens=prompt_tokens,
+            source=source,
+        )
+
     def build_stage_metrics(
         self,
         request_outputs: list[Any],
@@ -598,6 +684,7 @@ class StagePool:
         batch_id = metrics.batch_seq
         metrics.agg_total_tokens += num_tokens_out
         metrics.agg_total_gen_time_ms += stage_gen_time_ms
+        kv_snapshot = self._build_kv_snapshot(request_outputs, num_tokens_out)
 
         return StageRequestMetrics(
             num_tokens_in=num_tokens_in,
@@ -628,6 +715,7 @@ class StagePool:
             vllm_tpot_ms=float(native_text_metrics.get("vllm_tpot_ms") or 0.0),
             vllm_itl_ms=float(native_text_metrics.get("vllm_itl_ms") or 0.0),
             vllm_itls_ms=list(native_text_metrics.get("vllm_itls_ms") or []),
+            kv_snapshot=kv_snapshot,
         )
 
     def _infer_output_unit_type(self, request_outputs: list[Any], *, token_count: int) -> str:

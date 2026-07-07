@@ -11,6 +11,7 @@ from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.core.sched.output import OmniChunkRecvHandle, OmniSchedulerOutput
+from vllm_omni.metrics.kv import normalize_kv_block_ids
 
 logger = init_logger(__name__)
 
@@ -49,6 +50,54 @@ class OmniSchedulerMixin:
     # ------------------------------------------------------------------ #
     #  Shared scheduler/output helpers (lift the AR / generation duplicates)
     # ------------------------------------------------------------------ #
+
+    def _kv_sequence_len_for_request(self, request: Request) -> int:
+        get_confirmed = getattr(self, "_get_confirmed_num_computed_tokens", None)
+        if callable(get_confirmed):
+            try:
+                seq_len = int(get_confirmed(request))
+                if seq_len > 0:
+                    return seq_len
+            except Exception:
+                pass
+        try:
+            seq_len = int(getattr(request, "num_computed_tokens", 0) or 0)
+            if seq_len > 0:
+                return seq_len
+        except Exception:
+            pass
+        try:
+            return len(getattr(request, "prompt_token_ids", None) or []) + len(
+                getattr(request, "output_token_ids", None) or []
+            )
+        except Exception:
+            return 0
+
+    def _build_kv_cache_metrics_payload(self, request: Request) -> dict[str, Any] | None:
+        """Best-effort allocator snapshot for per-stage KV efficiency metrics."""
+        try:
+            kv_cache_manager = getattr(self, "kv_cache_manager", None)
+            get_block_ids = getattr(kv_cache_manager, "get_block_ids", None)
+            if not callable(get_block_ids):
+                return None
+            block_ids = normalize_kv_block_ids(get_block_ids(request.request_id))
+            if not block_ids:
+                return None
+            seq_len = self._kv_sequence_len_for_request(request)
+            if seq_len <= 0:
+                return None
+            return {
+                "seq_len": seq_len,
+                "block_ids": block_ids,
+                "source": "kv_cache_manager",
+            }
+        except Exception:
+            logger.debug(
+                "Failed to collect KV cache metrics for request %s",
+                getattr(request, "request_id", "<unknown>"),
+                exc_info=True,
+            )
+            return None
 
     def _consume_pending_connector_output(self, model_mode: str) -> None:
         """Drain ``self._latest_omni_connector_output`` into the coordinator.
