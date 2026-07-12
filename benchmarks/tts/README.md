@@ -150,54 +150,6 @@ python benchmarks/tts/plot_results.py \
 Outputs TTFP / RTF / throughput curves (and a markdown table) for every
 `(task, concurrency)` combination in the result set.
 
-### 5. Decode preprocess microbenchmark
-
-Compare scalar `preprocess(...)` with `preprocess_decode_batch(...)` on
-synthetic Qwen3-TTS decode states. Output parity is checked by default:
-
-```bash
-python benchmarks/tts/bench_qwen3_tts_decode_preprocess.py \
-    --device cuda --batch-sizes 1 2 4 8 16 32 64 \
-    --hidden-size 4096 --tail-frames 128 --warmups 20 --repeats 100 \
-    --output-json ./results/qwen3_tts_decode_preprocess.json
-```
-
-This is a dependency-light operator benchmark, not a full serving trace.
-
-### 6. Engine-level scalar-vs-batched A/B
-
-Run the same serving sweep twice, once with the fast path disabled on the
-server and once with the default batched path, then compare the result dirs:
-
-```bash
-# A: scalar baseline (fast path disabled)
-VLLM_OMNI_DISABLE_BATCH_DECODE_PREPROCESS=1 \
-    vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni --port 8000 &
-python benchmarks/tts/bench_tts.py \
-    --model Qwen/Qwen3-TTS-12Hz-1.7B-Base --task voice_clone \
-    --dataset-path /path/to/seed-tts-eval \
-    --concurrency 1 8 32 --num-prompts 64 --output-dir ./results/scalar
-# stop the server.
-
-# B: batched fast path (default)
-vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni --port 8000 &
-python benchmarks/tts/bench_tts.py \
-    --model Qwen/Qwen3-TTS-12Hz-1.7B-Base --task voice_clone \
-    --dataset-path /path/to/seed-tts-eval \
-    --concurrency 1 8 32 --num-prompts 64 --output-dir ./results/batched
-# stop the server.
-
-# Diff the two sweeps
-python benchmarks/tts/compare_decode_preprocess_ab.py \
-    --scalar ./results/scalar --batched ./results/batched \
-    --output-json ./results/ab_table.json
-```
-
-`compare_decode_preprocess_ab.py` matches runs by concurrency, prints a
-TTFP / E2E-latency / throughput delta table, and **fails (non-zero exit) if
-concurrency=1 regresses** beyond a tolerance (default 5%, override with
-`--c1-tolerance`). Run each sweep on a quiesced GPU.
-
 ## Task types
 
 | Task            | Dataset           | Request body                                        | Checkpoints that support it              |

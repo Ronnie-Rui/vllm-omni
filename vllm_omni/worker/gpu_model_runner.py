@@ -1,6 +1,5 @@
 import contextlib
 import inspect
-import os
 from collections.abc import Callable
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
@@ -1521,10 +1520,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         """Return the batched decode-preprocess hook when the model overrides it.
 
         The mixin default raises, so inherited defaults keep the scalar path.
-        ``VLLM_OMNI_DISABLE_BATCH_DECODE_PREPROCESS=1`` is the A/B kill switch.
         """
-        if os.environ.get("VLLM_OMNI_DISABLE_BATCH_DECODE_PREPROCESS", "").lower() in ("1", "true", "yes", "on"):
-            return None
         hook = getattr(self.model, "preprocess_decode_batch", None)
         if not callable(hook):
             return None
