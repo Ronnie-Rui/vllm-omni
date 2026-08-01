@@ -56,6 +56,7 @@ class _QuantizationEngineOverrides(TypedDict, total=False):
 
 class _ModelEngineOverrides(TypedDict, total=False):
     active_stream_window: int
+    async_chunk_timeout_s: float
     enable_sleep_mode: bool
     subtalker_sampling_params: dict[str, Any]
     has_sampling_extra_args: bool
@@ -257,6 +258,10 @@ class OmniStageModelConfig:
     """Per-stage model behavior."""
 
     active_stream_window: int = Field(default=0, ge=0)
+    # ``None`` waits indefinitely. Values that look armed but never fire
+    # (``<= 0``, NaN) are rejected on the deploy-config/CLI path and normalized
+    # by ``_get_async_chunk_timeout_s``.
+    async_chunk_timeout_s: float | None = None
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None

@@ -379,6 +379,7 @@ def test_runtime_config_fields_match_rfc_runtime_scope():
 def test_sub_config_fields_match_rfc_scopes():
     assert {f.name for f in fields(OmniStageModelConfig)} == {
         "active_stream_window",
+        "async_chunk_timeout_s",
         "enable_sleep_mode",
         "default_sampling_params",
         "subtalker_sampling_params",

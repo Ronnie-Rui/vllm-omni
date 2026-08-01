@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 import re
 import warnings
 from collections.abc import Callable
@@ -491,6 +492,23 @@ class DeployConfig:
     data_parallel_size: int | None = None
     pipeline_parallel_size: int | None = None
     custom_voice_dir: str | None = None
+
+    def __post_init__(self) -> None:
+        validate_async_chunk_timeout_s(self.async_chunk_timeout_s)
+
+
+def validate_async_chunk_timeout_s(value: float | None, source: str = "async_chunk_timeout_s") -> None:
+    """Reject values that look armed but never fire.
+
+    ``None`` waits indefinitely on purpose. ``<= 0`` is read as "no timeout" by
+    the collector, and NaN never compares greater than the elapsed wait.
+    """
+    if value is None:
+        return
+    if not math.isfinite(value):
+        raise ValueError(f"{source} must be a finite number or null, got {value!r}")
+    if value <= 0:
+        raise ValueError(f"{source} must be positive or null, got {value!r}")
 
 
 _STAGE_RESERVED_KEYS = frozenset(

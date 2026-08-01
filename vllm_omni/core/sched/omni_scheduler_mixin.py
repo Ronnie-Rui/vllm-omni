@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import time
 from collections.abc import Iterable
@@ -189,11 +190,19 @@ class OmniSchedulerMixin:
         return super().make_stats(*args, **kwargs)
 
     def _get_async_chunk_timeout_s(self) -> float:
+        """Resolve the async-chunk wait timeout; ``0.0`` means "no timeout".
+
+        NaN is normalized rather than passed through: it would make every
+        ``elapsed > timeout`` check false and silently disarm the guard.
+        """
         model_config = self.vllm_config.model_config
         timeout_s = getattr(model_config, "async_chunk_timeout_s", None)
         if timeout_s is None:
             return 0.0
-        return float(timeout_s)
+        timeout_s = float(timeout_s)
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            return 0.0
+        return timeout_s
 
     def _finish_timed_out_chunk_requests(self, timed_out_ids: set[str]) -> None:
         """Fail requests that waited too long for upstream async chunks."""

@@ -28,6 +28,7 @@ from vllm_omni.config.stage_config import (
     build_stage_runtime_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
+    validate_async_chunk_timeout_s,
 )
 from vllm_omni.config.yaml_util import create_config
 from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
@@ -410,7 +411,10 @@ class StageConfigFactory:
             deploy_cfg.async_chunk = bool(cli_async_chunk)
         cli_async_chunk_timeout_s = cli_overrides.get("async_chunk_timeout_s")
         if cli_async_chunk_timeout_s is not None:
-            deploy_cfg.async_chunk_timeout_s = float(cli_async_chunk_timeout_s)
+            # Assignment here bypasses DeployConfig.__post_init__.
+            timeout_s = float(cli_async_chunk_timeout_s)
+            validate_async_chunk_timeout_s(timeout_s, source="--async-chunk-timeout-s")
+            deploy_cfg.async_chunk_timeout_s = timeout_s
 
         stages = merge_pipeline_deploy(pipeline_cfg, deploy_cfg, cli_overrides)
 
