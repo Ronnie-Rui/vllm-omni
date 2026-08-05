@@ -36,6 +36,7 @@ from vllm_omni.config.stage_config import (
     _select_processor_funcs,
     build_stage_runtime_overrides,
     load_deploy_config,
+    validate_async_chunk_timeout_s,
 )
 
 _EXECUTION_TYPE_TO_STAGE_WORKER: dict[StageExecutionType, tuple[StageType, str | None]] = {
@@ -258,10 +259,9 @@ class OmniStageModelConfig:
     """Per-stage model behavior."""
 
     active_stream_window: int = Field(default=0, ge=0)
-    # ``None`` waits indefinitely. Values that look armed but never fire
-    # (``<= 0``, NaN) are rejected on the deploy-config/CLI path and normalized
-    # by ``_get_async_chunk_timeout_s``.
-    async_chunk_timeout_s: float | None = None
+    # ``None`` waits indefinitely. ``allow_inf_nan=False`` is what rejects
+    # NaN/inf: ``gt=0`` alone lets both through (NaN compares false, inf true).
+    async_chunk_timeout_s: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
@@ -1281,6 +1281,16 @@ class VllmOmniConfig:
                 setattr(deploy, name, _copy_value(cli_overrides[name]))
 
         deploy = _apply_platform_overrides(deploy)
+        # DO NOT DELETE AS REDUNDANT. The ``setattr`` loop and
+        # ``_apply_platform_overrides`` run after ``__post_init__``, and the
+        # field's ``Field(gt=0, ...)`` only fires at construction (no
+        # ``validate_assignment`` in ``vllm_omni/``), so this is the only check.
+        if deploy.async_chunk_timeout_s is not None:
+            from_cli = cli_overrides.get("async_chunk_timeout_s") is not None
+            validate_async_chunk_timeout_s(
+                deploy.async_chunk_timeout_s,
+                source="--async-chunk-timeout-s" if from_cli else "async_chunk_timeout_s",
+            )
         if len(pipeline_cfg.stages) <= 1:
             deploy.async_chunk = False
         _validate_async_chunk_support(pipeline_cfg, deploy)

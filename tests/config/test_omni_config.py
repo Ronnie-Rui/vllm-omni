@@ -38,6 +38,7 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     load_deploy_config,
     merge_pipeline_deploy,
+    validate_async_chunk_timeout_s,
 )
 from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
@@ -934,3 +935,84 @@ def test_diffusion_config_projection_keeps_mapping_quantization_config_serializa
     cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(quantization_config=quantization_config)
 
     assert cfg.quantization_config == quantization_config
+
+
+# --- async_chunk_timeout_s: structured / legacy validation parity ---------
+
+# All four look armed but never fire: <= 0 reads as "no timeout", NaN never
+# compares greater than the elapsed wait, inf never elapses.
+_UNARMABLE_TIMEOUTS = [0, 0.0, -1.0, float("nan"), float("inf"), float("-inf")]
+
+
+@pytest.mark.parametrize("bad_value", _UNARMABLE_TIMEOUTS)
+def test_omni_stage_model_config_rejects_unarmable_timeout(bad_value):
+    with pytest.raises(ValidationError):
+        OmniStageModelConfig(async_chunk_timeout_s=bad_value)
+
+
+@pytest.mark.parametrize("bad_value", _UNARMABLE_TIMEOUTS)
+def test_validate_async_chunk_timeout_s_rejects_unarmable(bad_value):
+    """Legacy path: same verdict and same exception type as the structured one."""
+    with pytest.raises(ValueError):
+        validate_async_chunk_timeout_s(bad_value)
+
+
+def test_validate_async_chunk_timeout_s_raises_value_error_for_non_numeric():
+    """Must be ValueError, not the TypeError raw ``math.isfinite("abc")`` gives."""
+    with pytest.raises(ValueError):
+        validate_async_chunk_timeout_s("abc")
+
+
+@pytest.mark.parametrize("bad_value", [-1.0, float("nan")])
+def test_field_constraints_do_not_fire_on_assignment(bad_value):
+    """Half one of why the ``from_pipeline_config`` re-check is load-bearing.
+
+    ``validate_assignment`` is not enabled, so ``Field(gt=0)`` only runs at
+    construction and a later ``setattr`` assigns anything. Enabling it would
+    flip this to red, forcing a deliberate look at the re-check.
+    """
+    config = OmniStageModelConfig(async_chunk_timeout_s=7.5)
+
+    config.async_chunk_timeout_s = bad_value
+
+    if bad_value != bad_value:  # NaN
+        assert config.async_chunk_timeout_s != config.async_chunk_timeout_s
+    else:
+        assert config.async_chunk_timeout_s == bad_value
+
+
+@pytest.mark.parametrize("bad_value", [0, -1.0, float("nan"), float("inf")])
+def test_from_pipeline_config_revalidates_timeout_after_setattr(bad_value):
+    """Half two: the full path rejects it anyway. Delete the re-check, go red."""
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+
+    # Poison after __post_init__, exactly as the override paths do.
+    deploy = DeployConfig(async_chunk_timeout_s=7.5)
+    deploy.async_chunk_timeout_s = bad_value
+
+    with pytest.raises(ValueError, match="async_chunk_timeout_s"):
+        VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+
+
+@pytest.mark.parametrize("bad_value", [0, -1.0, float("nan"), float("inf")])
+def test_from_pipeline_config_rejects_unarmable_cli_override(bad_value):
+    """A CLI-supplied value is reported against the flag name, not the field."""
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+
+    with pytest.raises(ValueError, match="--async-chunk-timeout-s"):
+        VllmOmniConfig.from_pipeline_config(
+            pipeline,
+            cli_overrides={"async_chunk_timeout_s": bad_value},
+        )
+
+
+def test_from_pipeline_config_accepts_valid_timeout_override():
+    """Zero-regression guard: the re-check must not reject legitimate values."""
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+
+    omni_config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        cli_overrides={"async_chunk_timeout_s": 7.5},
+    )
+
+    assert omni_config.stage_by_id(0).model_config.async_chunk_timeout_s == 7.5

@@ -502,12 +502,19 @@ def validate_async_chunk_timeout_s(value: float | None, source: str = "async_chu
 
     ``None`` waits indefinitely on purpose. ``<= 0`` is read as "no timeout" by
     the collector, and NaN never compares greater than the elapsed wait.
+
+    Coerces first so both paths raise ``ValueError``: an unconverted YAML
+    string would make ``math.isfinite`` raise ``TypeError`` instead.
     """
     if value is None:
         return
-    if not math.isfinite(value):
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{source} must be a finite number or null, got {value!r}") from None
+    if not math.isfinite(numeric):
         raise ValueError(f"{source} must be a finite number or null, got {value!r}")
-    if value <= 0:
+    if numeric <= 0:
         raise ValueError(f"{source} must be positive or null, got {value!r}")
 
 

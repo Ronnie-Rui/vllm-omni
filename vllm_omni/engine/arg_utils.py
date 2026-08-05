@@ -9,6 +9,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
 
 from vllm_omni.config import OmniModelConfig
+from vllm_omni.config.stage_config import validate_async_chunk_timeout_s
 from vllm_omni.outputs.output_modality import OutputModality
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.plugins import load_omni_general_plugins
@@ -212,6 +213,12 @@ class OmniEngineArgs(EngineArgs):
                 self.worker_cls = current_omni_platform.get_omni_ar_worker_cls()
             elif self.worker_type == "generation":
                 self.worker_cls = current_omni_platform.get_omni_generation_worker_cls()
+        # Last gate before OmniStageModelConfig: the legacy path merges
+        # ``engine_extras`` / ``stage_N_*`` in as raw dict keys that skipped
+        # DeployConfig.__post_init__. Normalized so downstream sees a number.
+        if self.async_chunk_timeout_s is not None:
+            validate_async_chunk_timeout_s(self.async_chunk_timeout_s)
+            self.async_chunk_timeout_s = float(self.async_chunk_timeout_s)
         load_omni_general_plugins()
         super().__post_init__()
 
