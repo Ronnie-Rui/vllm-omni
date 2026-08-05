@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import itertools
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
@@ -19,6 +20,10 @@ from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
 
 logger = get_connector_logger(__name__)
+
+# ``_pending_save_reqs`` marker discriminator; ``save_async`` tasks have no
+# ``"kind"``, so the legacy branch still runs for them unchanged.
+_CLEANUP_SENDER_TASK = "cleanup_sender"
 
 
 class OmniChunkTransferAdapter(OmniTransferAdapterBase):
@@ -95,6 +100,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.requests_num_chunks_sent: dict[str, int] = defaultdict(int)
         self._pending_streaming_prefills: dict[str, dict] = {}
         self._waiting_for_chunk_since: dict[str, float] = {}
+        # Last send-enqueue ticket per *internal* id (never reused, unlike a
+        # resumable ``/v1/realtime`` external id). Plain dict, so a read cannot
+        # resurrect a reclaimed key.
+        self._sender_generation: dict[str, int] = {}
+        # Adapter-wide, so a popped-then-resent id cannot re-mint a ticket a
+        # queued marker already snapshotted. ``count`` not ``+= 1``: two equal
+        # tickets make the guard read "unchanged" and reclaim live state.
+        self._sender_generation_seq = itertools.count(1)
 
     @staticmethod
     def _is_truthy_scalar(value: Any) -> bool:
@@ -189,6 +202,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return
 
         self.requests_num_chunks_sent[request.external_req_id] = confirmed_num_computed_tokens
+        # Mint before the append: a later marker must snapshot a ticket that
+        # only changes if this id sends again. Starts at 1 so 0 stays the
+        # "never sent" sentinel no re-mint can equal -- ``count(0)`` would
+        # silently disarm the revival guard.
+        self._sender_generation[request.request_id] = next(self._sender_generation_seq)
         task = {
             "multimodal_output": multimodal_output,
             "request": request,
@@ -304,6 +322,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         return False
 
     def _send_single_request(self, task: dict):
+        # Markers ride this queue to inherit its FIFO drain barrier.
+        if task.get("kind") == _CLEANUP_SENDER_TASK:
+            self._run_deferred_cleanup(task)
+            return
+
         raw_mm = task["multimodal_output"]
         multimodal_output = unflatten_payload(raw_mm) if isinstance(raw_mm, Mapping) else raw_mm
         request = task["request"]
@@ -424,6 +447,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.request_ids_mapping.pop(request_id, None)
         self.requests_origin_status.pop(request_id, None)
         self._waiting_for_chunk_since.pop(request_id, None)
+        # Internal-id-keyed, so ``cleanup_sender`` (external id) never reclaims
+        # it and the ordinary success path would otherwise leak one per request.
+        self._sender_generation.pop(request_id, None)
         self._discard_from_chunk_deque(self.waiting_for_chunk_waiting_requests, request_id)
         self._discard_from_chunk_deque(self.waiting_for_chunk_running_requests, request_id)
         self._discard_from_chunk_deque(self._held_non_active, request_id)
@@ -440,24 +466,118 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             if request.request_id != request_id:
                 deque_list.append(request)
 
+    def _sender_state_containers(self) -> list[dict]:
+        """Sender-side dicts keyed by external request id. Single source of
+        truth, so ``cleanup_sender`` and the marker path cannot drift apart."""
+        containers = [
+            self.put_req_chunk,
+            self.request_payload,
+            self.code_prompt_token_ids,
+            self.requests_num_chunks_sent,
+            self.ramp_chunk_count,
+            self._pending_streaming_prefills,
+        ]
+        cached_ic = getattr(self, "_cached_ic", None)
+        if cached_ic is not None:
+            containers.append(cached_ic)
+        return containers
+
     def cleanup_sender(self, external_req_id: str) -> None:
         """Reclaim sender-side per-request state (keyed by external id).
 
-        Must only be called after the terminal chunk has actually been
-        sent (i.e. from ``_send_single_request``), not before.
+        Only safe once every already-enqueued send for this id has left
+        ``_pending_save_reqs`` -- from ``_send_single_request`` after the
+        terminal chunk, or from a marker (see ``retire_sender``). Earlier, a
+        queued send re-creates ``put_req_chunk`` at 0 and reuses a sent key.
 
         Idempotent: calling with an already-cleaned or unknown id is safe.
         """
-        self.put_req_chunk.pop(external_req_id, None)
-        self.request_payload.pop(external_req_id, None)
-        self.code_prompt_token_ids.pop(external_req_id, None)
-        self.requests_num_chunks_sent.pop(external_req_id, None)
-        self.ramp_chunk_count.pop(external_req_id, None)
-        self._pending_streaming_prefills.pop(external_req_id, None)
+        for container in self._sender_state_containers():
+            container.pop(external_req_id, None)
 
-        cached_ic = getattr(self, "_cached_ic", None)
-        if cached_ic is not None:
-            cached_ic.pop(external_req_id, None)
+    def retire_sender(
+        self,
+        request_id: str,
+        external_req_id: str | None = None,
+    ) -> None:
+        """Queue sender-side reclamation behind this id's pending sends.
+
+        A timed-out request is finished ``FINISHED_ERROR``, so it never produces
+        the terminal payload whose ``put`` triggers ``cleanup_sender``, and its
+        sender state leaks permanently. Reclaiming inline instead would let a
+        still-queued send resurrect ``put_req_chunk`` as a fresh
+        ``defaultdict`` 0 and reuse an already-sent connector key -- hence a
+        marker on the tail of ``_pending_save_reqs``, whose single strictly-FIFO
+        consumer makes queue order the drain barrier. A lock, counter or
+        deadline would reintroduce the race this avoids.
+
+        Must run *before* ``cleanup_receiver``, which pops
+        ``request_ids_mapping`` and leaves the external id unresolvable. The
+        revival guard survives the reverse order because ``0`` is a ticket no
+        live sender holds -- do not weaken the sentinel to ``count(0)``.
+
+        ``external_req_id`` is resolved from the mapping when *None*.
+        Never raises, idempotent, does no I/O.
+        """
+        if external_req_id is None:
+            external_req_id = self.request_ids_mapping.get(request_id, request_id)
+            if request_id not in self.request_ids_mapping:
+                # The recv thread writes this mapping, so timing out before it
+                # was touched lands here -- wrong key if the ids differ.
+                logger.debug(
+                    "retire_sender(%s): no external id mapping yet, falling back to the internal id; "
+                    "sender state under a differing external id would be missed",
+                    request_id,
+                )
+
+        task = {
+            "kind": _CLEANUP_SENDER_TASK,
+            "request_id": request_id,
+            "external_req_id": external_req_id,
+            # Snapshot: lets the marker detect a later send and stand down.
+            "generation": self._sender_generation.get(request_id, 0),
+        }
+        self._pending_save_reqs.append(task)
+        with self._save_cond:
+            self._save_cond.notify()
+
+    def _run_deferred_cleanup(self, task: dict) -> None:
+        """Execute a cleanup marker on the save_loop thread.
+
+        Each container is popped under its own ``try``: ``save_loop``'s blanket
+        ``except`` would abandon the rest and leave the leak half-fixed.
+
+        Load-bearing invariant: liveness comes from ``_sender_generation``
+        (internal id) but reclaiming uses the external id, sound only while
+        internal -> external is injective across live senders. Nothing shares an
+        external id today; if that changes, re-key liveness on the external id.
+        """
+        request_id = task["request_id"]
+        external_req_id = task["external_req_id"]
+
+        generation = self._sender_generation.get(request_id)
+        if generation is not None and generation != task["generation"]:
+            # Sent again after being retired: reclaiming would strand a live
+            # request. Absent means nothing re-enqueued, so reclaim is correct.
+            logger.debug(
+                "Skipping deferred sender cleanup for %s: generation %s != %s",
+                request_id,
+                generation,
+                task["generation"],
+            )
+            return
+
+        for container in self._sender_state_containers():
+            try:
+                container.pop(external_req_id, None)
+            except Exception as e:
+                logger.warning(f"Deferred sender cleanup failed for {external_req_id}: {e}")
+        self._sender_generation.pop(request_id, None)
+        logger.debug(
+            "Reclaimed sender state for %s (external %s) after queued sends drained",
+            request_id,
+            external_req_id,
+        )
 
     def cleanup(
         self,

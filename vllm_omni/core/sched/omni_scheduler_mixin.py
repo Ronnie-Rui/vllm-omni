@@ -201,6 +201,16 @@ class OmniSchedulerMixin:
             return 0.0
         timeout_s = float(timeout_s)
         if not math.isfinite(timeout_s) or timeout_s <= 0:
+            # Deduped: this runs every ``schedule()`` tick. Holds the last
+            # value, not a set, so a changed value warns again. Keyed on repr
+            # because ``nan != nan`` would re-warn every tick.
+            seen_key = repr(timeout_s)
+            if getattr(self, "_warned_unarmable_chunk_timeout", None) != seen_key:
+                self._warned_unarmable_chunk_timeout = seen_key
+                logger.warning(
+                    "async_chunk_timeout_s=%r is not armable (must be finite and > 0); treating it as no timeout",
+                    timeout_s,
+                )
             return 0.0
         return timeout_s
 
@@ -228,7 +238,14 @@ class OmniSchedulerMixin:
 
         chunk_transfer_adapter: Any = getattr(self, "chunk_transfer_adapter", None)
         if chunk_transfer_adapter is not None:
+            # BEFORE ``cleanup_receiver``, which pops ``request_ids_mapping``:
+            # afterwards the external id falls back to the internal one and any
+            # middle stage reclaims the wrong key. ``getattr`` because
+            # ``OmniTransferAdapterBase`` does not declare the hook.
+            retire_sender = getattr(chunk_transfer_adapter, "retire_sender", None)
             for request in timed_out_requests:
+                if retire_sender is not None:
+                    retire_sender(request.request_id)
                 chunk_transfer_adapter.cleanup_receiver(request.request_id)
 
     def _realign_request_status_to_queues(

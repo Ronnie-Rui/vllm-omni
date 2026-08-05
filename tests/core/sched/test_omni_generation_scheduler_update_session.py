@@ -8,6 +8,7 @@ update payloads early.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -237,6 +238,21 @@ class _DummyWaitingQueue(list):
 class _DummyChunkTransferAdapter:
     def __init__(self):
         self.cleanup_receiver_calls = []
+        self.call_order = []
+
+    def cleanup_receiver(self, request_id):
+        self.cleanup_receiver_calls.append(request_id)
+        self.call_order.append(("cleanup_receiver", request_id))
+
+    def retire_sender(self, request_id):
+        self.call_order.append(("retire_sender", request_id))
+
+
+class _ReceiverOnlyChunkTransferAdapter:
+    """Adapter without the sender hook, as ``OmniTransferAdapterBase`` is."""
+
+    def __init__(self):
+        self.cleanup_receiver_calls = []
 
     def cleanup_receiver(self, request_id):
         self.cleanup_receiver_calls.append(request_id)
@@ -298,6 +314,113 @@ def test_finish_timed_out_chunk_requests_removes_and_cleans_up():
         "running",
         "waiting",
     ]
+
+
+def test_finish_timed_out_chunk_requests_retires_sender_before_receiver():
+    """Order is a hard constraint: ``cleanup_receiver`` pops the id mapping.
+
+    Once it is gone the external id is unresolvable, so a request whose
+    external id differs gets the wrong sender key reclaimed.
+    """
+    scheduler = _TimeoutSchedulerStub()
+    first = _timeout_request("a", "ext-a")
+    second = _timeout_request("b", "ext-b")
+    scheduler.running.extend([first, second])
+    scheduler.requests = {"a": first, "b": second}
+
+    scheduler._finish_timed_out_chunk_requests({"a", "b"})
+
+    assert scheduler.chunk_transfer_adapter.call_order == [
+        ("retire_sender", "a"),
+        ("cleanup_receiver", "a"),
+        ("retire_sender", "b"),
+        ("cleanup_receiver", "b"),
+    ]
+
+
+def test_finish_timed_out_chunk_requests_tolerates_adapter_without_retire_sender():
+    """``OmniTransferAdapterBase`` lacks the hook; a hard call would raise here."""
+    scheduler = _TimeoutSchedulerStub()
+    scheduler.chunk_transfer_adapter = _ReceiverOnlyChunkTransferAdapter()
+    req = _timeout_request("running", "ext-running")
+    scheduler.running.append(req)
+    scheduler.requests = {"running": req}
+
+    scheduler._finish_timed_out_chunk_requests({"running"})
+
+    assert scheduler.chunk_transfer_adapter.cleanup_receiver_calls == ["running"]
+
+
+@pytest.mark.parametrize("bad_value", [0, -1.0, float("nan"), float("inf"), float("-inf")])
+def test_get_async_chunk_timeout_s_warns_when_disarming(bad_value, caplog):
+    """A configured-but-unarmable value must not be silently downgraded."""
+    scheduler = _TimeoutSchedulerStub()
+    scheduler.vllm_config.model_config.async_chunk_timeout_s = bad_value
+
+    with caplog.at_level(logging.WARNING):
+        assert scheduler._get_async_chunk_timeout_s() == 0.0
+
+    assert "not armable" in caplog.text
+
+
+@pytest.mark.parametrize("bad_value", [0, float("nan")])
+def test_get_async_chunk_timeout_s_warns_once_per_repeated_value(bad_value, caplog):
+    """Runs every ``schedule()`` tick, so it must not spam.
+
+    NaN included on purpose: ``nan != nan``, so a dedup keyed on the raw
+    float rather than its repr would re-warn forever.
+    """
+    scheduler = _TimeoutSchedulerStub()
+    scheduler.vllm_config.model_config.async_chunk_timeout_s = bad_value
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(50):
+            assert scheduler._get_async_chunk_timeout_s() == 0.0
+
+    assert caplog.text.count("not armable") == 1
+
+
+def test_get_async_chunk_timeout_s_rewarns_when_the_value_changes(caplog):
+    """Dedup holds one repr, not a set, so a changed value warns again.
+
+    Intended: the message reports the ongoing state "your timeout is not in
+    effect", so a second bad value is news. ``warns_once_per_repeated_value``
+    passes under either design -- only this test separates them.
+    """
+    scheduler = _TimeoutSchedulerStub()
+
+    with caplog.at_level(logging.WARNING):
+        for value in [0, float("nan"), 0, float("nan")]:
+            scheduler.vllm_config.model_config.async_chunk_timeout_s = value
+            assert scheduler._get_async_chunk_timeout_s() == 0.0
+
+    assert caplog.text.count("not armable") == 4
+
+
+def test_get_async_chunk_timeout_s_warns_per_scheduler_instance(caplog):
+    """Dedup state is per instance, so each stage's scheduler reports itself."""
+    first = _TimeoutSchedulerStub()
+    second = _TimeoutSchedulerStub()
+    first.vllm_config.model_config.async_chunk_timeout_s = 0
+    second.vllm_config.model_config.async_chunk_timeout_s = 0
+
+    with caplog.at_level(logging.WARNING):
+        first._get_async_chunk_timeout_s()
+        first._get_async_chunk_timeout_s()
+        second._get_async_chunk_timeout_s()
+
+    assert caplog.text.count("not armable") == 2
+
+
+def test_get_async_chunk_timeout_s_does_not_warn_when_disabled(caplog):
+    """``None`` is the default and must stay silent."""
+    scheduler = _TimeoutSchedulerStub()
+    scheduler.vllm_config.model_config.async_chunk_timeout_s = None
+
+    with caplog.at_level(logging.WARNING):
+        assert scheduler._get_async_chunk_timeout_s() == 0.0
+
+    assert "not armable" not in caplog.text
 
 
 class _RealignSchedulerStub(OmniSchedulerMixin):

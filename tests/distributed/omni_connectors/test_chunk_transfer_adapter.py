@@ -1600,3 +1600,304 @@ def test_purge_is_noop_on_empty_deques(build_adapter):
     adapter.restore_queues(waiting_queue, running_queue, scheduler_requests={})
     assert running_queue == []
     assert waiting_queue == []
+
+
+# --- retire_sender: deferred sender-side cleanup for timed-out requests ---
+
+
+def _install_payload_processor(adapter) -> None:
+    """Without a processor, a non-terminal chunk returns early and never ``put``s."""
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.tensor([1, 2], dtype=torch.long)),
+    )
+
+
+def _sender_req(req_id: str, external_req_id: str | None = None, *, finished: bool = False):
+    return SimpleNamespace(
+        request_id=req_id,
+        external_req_id=external_req_id or req_id,
+        status=RequestStatus.RUNNING,
+        num_computed_tokens=1,
+        num_output_placeholders=0,
+        resumable=False,
+        is_finished=lambda: finished,
+    )
+
+
+def _seed_sender_state(adapter, external_req_id: str) -> None:
+    adapter.put_req_chunk[external_req_id] = 3
+    adapter.request_payload[external_req_id] = {"payload": 1}
+    adapter.code_prompt_token_ids[external_req_id] = [1, 2]
+    adapter.requests_num_chunks_sent[external_req_id] = 2
+    adapter.ramp_chunk_count[external_req_id] = 1
+    adapter._pending_streaming_prefills[external_req_id] = {"x": 1}
+
+
+def _sender_state_present(adapter, external_req_id: str) -> list[bool]:
+    return [external_req_id in container for container in adapter._sender_state_containers()]
+
+
+def _put_keys(connector) -> list[str]:
+    """The ``put_key`` per call. Key reuse is invisible to call counts."""
+    return [call.kwargs["put_key"] for call in connector.put.call_args_list]
+
+
+def test_retire_sender_appends_marker_without_reclaiming_inline(build_adapter):
+    """Inline reclaim would let a queued send re-create ``put_req_chunk`` at 0."""
+    adapter, _ = build_adapter(stage_id=1)
+    _seed_sender_state(adapter, "ext-1")
+    adapter.request_ids_mapping["req-1"] = "ext-1"
+
+    adapter.retire_sender("req-1")
+
+    assert all(_sender_state_present(adapter, "ext-1"))
+    assert len(adapter._pending_save_reqs) == 1
+    marker = adapter._pending_save_reqs[0]
+    assert marker["kind"] == "cleanup_sender"
+    assert marker["request_id"] == "req-1"
+    assert marker["external_req_id"] == "ext-1"
+
+
+def test_retire_sender_marker_runs_behind_already_queued_sends(build_adapter):
+    """FIFO order *is* the drain barrier -- no lock, counter or deadline."""
+    adapter, connector = build_adapter(stage_id=1)
+    _install_payload_processor(adapter)
+    adapter.request_ids_mapping["req-1"] = "ext-1"
+    request = _sender_req("req-1", "ext-1")
+
+    adapter.save_async(multimodal_output={"a": 1}, request=request, is_segment_finished=False)
+    adapter.retire_sender("req-1")
+
+    assert len(adapter._pending_save_reqs) == 2
+    assert adapter._pending_save_reqs[0].get("kind") is None
+    assert adapter._pending_save_reqs[-1]["kind"] == "cleanup_sender"
+
+    # Drain in FIFO order, exactly as save_loop does.
+    order = []
+    while adapter._pending_save_reqs:
+        task = adapter._pending_save_reqs.popleft()
+        order.append(task.get("kind") or "send")
+        adapter._send_single_request(task)
+
+    assert order == ["send", "cleanup_sender"]
+    assert _put_keys(connector) == ["ext-1_1_0"]
+    assert not any(_sender_state_present(adapter, "ext-1"))
+
+
+def test_retire_sender_reclaims_all_sender_containers(build_adapter):
+    """Marker execution must clear the same set ``cleanup_sender`` does."""
+    adapter, _ = build_adapter(stage_id=1)
+    _seed_sender_state(adapter, "ext-1")
+    adapter._cached_ic = {"ext-1": object()}
+    adapter.request_ids_mapping["req-1"] = "ext-1"
+
+    adapter.retire_sender("req-1")
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    assert not any(_sender_state_present(adapter, "ext-1"))
+    assert "ext-1" not in adapter._cached_ic
+    assert "req-1" not in adapter._sender_generation
+
+
+def test_retire_sender_never_lets_a_later_send_reuse_a_connector_key(build_adapter):
+    """The reviewer's scenario, asserted on the only signal that moves: the keys.
+
+    ``put_req_chunk`` is a ``defaultdict(int)``, so reclaiming it while a send
+    for the same id is still queued makes the next read return 0 and rebuild an
+    already-used ``{ext}_{stage}_0`` key -- two payloads under one key. Call
+    counts and final emptiness hold either way, so only the key strings move.
+    """
+    adapter, connector = build_adapter(stage_id=1)
+    _install_payload_processor(adapter)
+    adapter.request_ids_mapping["req-1"] = "ext-1"
+    request = _sender_req("req-1", "ext-1")
+
+    # Chunk 0 is sent for real, then the request is retired and sends again.
+    adapter.save_async(multimodal_output={"a": 1}, request=request, is_segment_finished=False)
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    adapter.retire_sender("req-1")
+    adapter.save_async(multimodal_output={"b": 2}, request=request, is_segment_finished=False)
+    assert [t.get("kind") for t in adapter._pending_save_reqs] == ["cleanup_sender", None]
+
+    while adapter._pending_save_reqs:
+        adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    keys = _put_keys(connector)
+    assert len(set(keys)) == 2, f"connector key reused across chunks: {keys}"
+    assert keys == ["ext-1_1_0", "ext-1_1_1"]
+    assert not keys[1].endswith("_0")
+
+
+def test_retire_sender_before_cleanup_receiver_is_required(build_adapter):
+    """Reverse order reclaims the WRONG key -- ``cleanup_receiver`` pops the mapping.
+
+    After that the external id falls back to the internal id, so the real
+    "ext-1" state survives untouched and the leak is back.
+    """
+    adapter, _ = build_adapter(stage_id=1)
+    _seed_sender_state(adapter, "ext-1")
+    adapter.request_ids_mapping["req-1"] = "ext-1"
+
+    # Wrong order on purpose.
+    adapter.cleanup_receiver("req-1")
+    adapter.retire_sender("req-1")
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    assert all(_sender_state_present(adapter, "ext-1"))
+
+    # Correct order resolves the mapping and does reclaim it.
+    adapter.request_ids_mapping["req-1"] = "ext-1"
+    adapter.retire_sender("req-1")
+    adapter.cleanup_receiver("req-1")
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    assert not any(_sender_state_present(adapter, "ext-1"))
+
+
+def test_reverse_order_keeps_the_revival_guard_armed(build_adapter):
+    """Reverse order breaks key resolution only; the guard itself still holds.
+
+    ``cleanup_receiver`` also pops ``_sender_generation``, so a marker minted
+    after it snapshots the ``0`` fallback. That is not a second failure mode:
+    tickets come from ``count(1)``, so no live sender can hold ``0`` and a
+    re-minted ticket can never match it. Both branches are asserted because
+    only side by side do they show the sentinel is the deciding step.
+    ``external_req_id`` is passed explicitly to isolate the guard from key
+    resolution -- otherwise both cases read as "state survived".
+    """
+    # Case 1: ticket popped, no later send -> absent branch -> reclaim.
+    adapter, _ = build_adapter(stage_id=1)
+    adapter.request_ids_mapping["req-1"] = "ext-1"
+    request = _sender_req("req-1", "ext-1")
+    adapter.save_async(multimodal_output={"a": 1}, request=request)
+    adapter._pending_save_reqs.clear()
+
+    adapter.cleanup_receiver("req-1")
+    assert "req-1" not in adapter._sender_generation
+    adapter.retire_sender("req-1", external_req_id="ext-1")
+    marker = adapter._pending_save_reqs.popleft()
+    assert marker["generation"] == 0
+
+    _seed_sender_state(adapter, "ext-1")
+    adapter._send_single_request(marker)
+    assert not any(_sender_state_present(adapter, "ext-1"))
+
+    # Case 2: same wrong order, but a send re-mints before the marker runs.
+    adapter2, _ = build_adapter(stage_id=1)
+    adapter2.request_ids_mapping["req-1"] = "ext-1"
+    request2 = _sender_req("req-1", "ext-1")
+    adapter2.save_async(multimodal_output={"a": 1}, request=request2)
+    adapter2._pending_save_reqs.clear()
+
+    adapter2.cleanup_receiver("req-1")
+    adapter2.retire_sender("req-1", external_req_id="ext-1")
+    marker2 = adapter2._pending_save_reqs.popleft()
+    assert marker2["generation"] == 0
+
+    adapter2.save_async(multimodal_output={"b": 2}, request=request2)
+    assert adapter2._sender_generation["req-1"] != 0
+    _seed_sender_state(adapter2, "ext-1")
+
+    adapter2._send_single_request(marker2)
+
+    # Guard armed: the queued send's live state was not reclaimed.
+    assert all(_sender_state_present(adapter2, "ext-1"))
+
+
+def test_retire_sender_stands_down_when_id_enqueues_more_sends(build_adapter):
+    """Revival guard: a live request must not be reclaimed by a stale marker."""
+    adapter, _ = build_adapter(stage_id=1)
+    adapter.request_ids_mapping["req-1"] = "ext-1"
+    request = _sender_req("req-1", "ext-1")
+
+    adapter.save_async(multimodal_output={"a": 1}, request=request)
+    adapter.retire_sender("req-1")
+    adapter.save_async(multimodal_output={"b": 2}, request=request)
+
+    marker = next(t for t in adapter._pending_save_reqs if t.get("kind") == "cleanup_sender")
+    _seed_sender_state(adapter, "ext-1")
+    adapter._send_single_request(marker)
+
+    assert all(_sender_state_present(adapter, "ext-1"))
+    assert "req-1" in adapter._sender_generation
+
+
+def test_retire_sender_ticket_is_monotonic_across_pop_and_resend(build_adapter):
+    """Tickets are adapter-wide, so a popped-then-resent id cannot land back
+    on a queued marker's snapshot value."""
+    adapter, _ = build_adapter(stage_id=1)
+    adapter.request_ids_mapping["req-1"] = "ext-1"
+    request = _sender_req("req-1", "ext-1")
+
+    adapter.save_async(multimodal_output={"a": 1}, request=request)
+    adapter.retire_sender("req-1")
+    marker = adapter._pending_save_reqs[-1]
+
+    adapter.cleanup_receiver("req-1")  # pops the ticket
+    adapter.save_async(multimodal_output={"b": 2}, request=request)  # re-mints
+
+    assert adapter._sender_generation["req-1"] != marker["generation"]
+    _seed_sender_state(adapter, "ext-1")
+    adapter._send_single_request(marker)
+    assert all(_sender_state_present(adapter, "ext-1"))
+
+
+def test_retire_sender_marker_survives_a_failing_container_pop(build_adapter, mocker: MockerFixture):
+    """Per-container try: ``save_loop``'s blanket except would abandon the rest."""
+    adapter, _ = build_adapter(stage_id=1)
+    _seed_sender_state(adapter, "ext-1")
+    adapter.request_ids_mapping["req-1"] = "ext-1"
+
+    class _ExplodingDict(dict):
+        def pop(self, *args, **kwargs):
+            raise RuntimeError("boom")
+
+    exploding = _ExplodingDict({"ext-1": 1})
+    mocker.patch.object(
+        adapter,
+        "_sender_state_containers",
+        return_value=[exploding, adapter.put_req_chunk, adapter.ramp_chunk_count],
+    )
+
+    adapter.retire_sender("req-1")
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    assert "ext-1" in exploding
+    assert "ext-1" not in adapter.put_req_chunk
+    assert "ext-1" not in adapter.ramp_chunk_count
+    assert "req-1" not in adapter._sender_generation
+
+
+def test_ordinary_send_path_is_unchanged_by_the_marker_branch(build_adapter):
+    """Zero-regression: ``save_async`` tasks carry no ``kind``, so the legacy
+    branch runs and a terminal payload still triggers ``cleanup``."""
+    adapter, connector = build_adapter(stage_id=1)
+    adapter.request_ids_mapping["req-1"] = "ext-1"
+    request = _sender_req("req-1", "ext-1", finished=True)
+
+    adapter.save_async(multimodal_output={"a": 1}, request=request, is_segment_finished=False)
+    task = adapter._pending_save_reqs.popleft()
+    assert "kind" not in task
+
+    adapter._send_single_request(task)
+
+    assert connector.put.call_count == 1
+    assert not any(_sender_state_present(adapter, "ext-1"))
+    assert "req-1" not in adapter.request_ids_mapping
+
+
+def test_retire_sender_marker_does_no_io(build_adapter):
+    """The marker only reclaims sender state -- it never touches the connector.
+
+    Draining it must not ``put`` anything: a payload here would reach the
+    downstream stage as if the timed-out request had produced output.
+    """
+    adapter, connector = build_adapter(stage_id=1)
+    adapter.request_ids_mapping["req-1"] = "ext-1"
+    _seed_sender_state(adapter, "ext-1")
+
+    adapter.retire_sender("req-1")
+
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    assert connector.put.call_count == 0
+    assert not any(_sender_state_present(adapter, "ext-1"))
