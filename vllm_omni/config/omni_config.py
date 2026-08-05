@@ -115,6 +115,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     ulysses_mode: str
     cfg_parallel_size: int
     vae_patch_parallel_size: int
+    text_encoder_tp_size: int
     use_hsdp: bool
     mask_sp_padding: bool
     hsdp_shard_size: int
@@ -262,6 +263,7 @@ class OmniStageModelConfig:
     # ``None`` waits indefinitely. ``allow_inf_nan=False`` is what rejects
     # NaN/inf: ``gt=0`` alone lets both through (NaN compares false, inf true).
     async_chunk_timeout_s: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    duplex_max_sessions: int = Field(default=1, ge=1)
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
@@ -375,6 +377,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     ulysses_mode: str = "strict"
     cfg_parallel_size: int = Field(default=1, ge=1)
     vae_patch_parallel_size: int = Field(default=1, ge=1)
+    text_encoder_tp_size: int = Field(default=1, ge=1)
     vae_parallel_mode: str = "tile"
     use_hsdp: bool = False
     mask_sp_padding: bool = False
@@ -971,7 +974,12 @@ def _build_common_stage_config_kwargs(
     return (
         {
             "stage_pipeline_config": topology,
-            "model_config": _build_model_config(topology, stage_deploy, engine.model),
+            "model_config": _build_model_config(
+                topology,
+                stage_deploy,
+                engine.model,
+                duplex_max_sessions=(deploy.duplex_session.max_sessions if deploy.session_mode == "duplex" else 1),
+            ),
             "load_config": _build_load_config(engine.load),
             "cache_config": _build_cache_config(deploy, engine.cache),
             "scheduler_config": _build_scheduler_config(deploy, engine.scheduler),
@@ -1124,6 +1132,8 @@ def _build_model_config(
     topology: StagePipelineConfig,
     stage_deploy: StageDeployConfig | None,
     engine: _ModelEngineOverrides,
+    *,
+    duplex_max_sessions: int,
 ) -> OmniStageModelConfig:
     default_sampling_params = _stage_sampling_params(stage_deploy, topology)
     kwargs = _config_kwargs(engine)
@@ -1135,6 +1145,7 @@ def _build_model_config(
         kwargs["tokenizer_subdir"] = topology.tokenizer_subdir
     return OmniStageModelConfig(
         default_sampling_params=default_sampling_params,
+        duplex_max_sessions=duplex_max_sessions,
         **kwargs,
     )
 
