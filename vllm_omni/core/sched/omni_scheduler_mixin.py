@@ -149,9 +149,7 @@ class OmniSchedulerMixin:
                 self.running,
                 scheduler_requests=self.requests,
             )
-            timed_out_ids = self.chunk_transfer_adapter.collect_timed_out_request_ids(
-                self._get_async_chunk_timeout_s()
-            )
+            timed_out_ids = self.chunk_transfer_adapter.collect_timed_out_request_ids(self._get_async_chunk_timeout_s())
             self._finish_timed_out_chunk_requests(timed_out_ids)
 
     def _restore_omni_wait_queues(self) -> None:
