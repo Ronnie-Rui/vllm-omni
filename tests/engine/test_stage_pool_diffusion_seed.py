@@ -54,7 +54,7 @@ async def test_plain_sampling_seed_survives_initial_and_streaming_normalization(
 
 
 @pytest.mark.asyncio
-async def test_feature_off_plain_sampling_params_preserve_legacy_seed_drop(monkeypatch):
+async def test_feature_off_plain_sampling_params_keep_caller_seed(monkeypatch):
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
     stage = _DummyDiffusionStage()
     pool = StagePool(0, stage)
@@ -63,7 +63,7 @@ async def test_feature_off_plain_sampling_params_preserve_legacy_seed_drop(monke
     await pool.submit_initial("request-test", state, "prompt")
     await pool.submit_update("request-test", state, "prompt-update")
 
-    assert [call[2].seed for call in stage.calls] == [None, None]
+    assert [call[2].seed for call in stage.calls] == [17, 17]
     assert all(isinstance(call[2], OmniDiffusionSamplingParams) for call in stage.calls)
 
 

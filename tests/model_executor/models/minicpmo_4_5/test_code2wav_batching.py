@@ -19,10 +19,12 @@ class _FakeEncoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.calls: list[int] = []
+        self.last_chunk_calls: list[bool] = []
 
     def forward_chunk(self, xs, last_chunk=False, cnn_cache=None, att_cache=None):
         batch, length, _ = xs.shape
         self.calls.append(batch)
+        self.last_chunk_calls.append(last_chunk)
         old_length = 0 if att_cache is None else att_cache.shape[3]
         output = xs[:, : max(1, length - 1)]
         cnn = xs[:, :1, :].transpose(1, 2).contiguous()
@@ -212,6 +214,18 @@ def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
     assert cache1[0, 0, 0, 0, 0].item() == 20
 
 
+def test_fade_in_out_limits_overlap_to_available_previous_audio():
+    speech = torch.arange(6, dtype=torch.float32).reshape(1, -1)
+    previous = torch.full((1, 3), 2.0)
+    window = torch.hamming_window(8, periodic=False)
+
+    actual = BatchedToken2Wav._fade_in_out(speech, previous, window)
+
+    expected = speech.clone()
+    expected[..., :3] = speech[..., :3] * window[:3] + previous * window[-3:]
+    torch.testing.assert_close(actual, expected)
+
+
 def test_estimator_cache_stack_split_round_trip_preserves_cfg_rows():
     token2wav = _FakeToken2Wav()
     adapter = BatchedToken2Wav(token2wav)
@@ -257,6 +271,166 @@ def test_model_preserves_output_slots_and_prefers_runtime_codes():
     torch.testing.assert_close(audios[0][0], torch.tensor(1.7 * 10))
     torch.testing.assert_close(audios[1][0], torch.tensor(1.7 * 20))
     assert token2wav.flow.encoder.calls[-1] == 2
+
+
+def test_code2wav_projects_duplex_metadata_to_final_audio_output():
+    model, token2wav = _model()
+    segment = _info("duplex", 0, [10, 11])
+    segment_text_utf8 = torch.tensor(list(b"hello"), dtype=torch.uint8)
+    segment["meta"].update(
+        {
+            "duplex_epoch": 3,
+            "duplex_turn_id": 7,
+            "llm_output_text_utf8": segment_text_utf8,
+            "tts_is_last_chunk": True,
+            "turn_end": False,
+        }
+    )
+
+    segment_output = _forward(model, [segment])
+
+    assert segment_output.multimodal_outputs["meta.turn_end"][0].item() is False
+    # A Talker unit boundary only drains pending codec tokens. The official
+    # streaming path keeps Token2wav open until the assistant turn ends.
+    assert token2wav.flow.encoder.last_chunk_calls[-1] is False
+    assert "duplex" in model._states
+
+    final = _info("duplex", 1, [12, 13], last_chunk=True)
+    final["meta"].update(segment["meta"])
+    final["meta"]["chunk_seq"] = 1
+    final["meta"]["last_chunk"] = True
+    final["meta"]["turn_end"] = True
+    output = _forward(model, [final])
+
+    payload = output.multimodal_outputs
+    assert "meta" not in payload
+    assert payload["meta.duplex_epoch"][0].item() == 3
+    assert payload["meta.duplex_turn_id"][0].item() == 7
+    torch.testing.assert_close(
+        payload["meta.llm_output_text_utf8"][0],
+        segment_text_utf8,
+    )
+    assert payload["meta.tts_is_last_chunk"][0].item() is True
+    assert payload["meta.turn_end"][0].item() is True
+    assert token2wav.flow.encoder.last_chunk_calls[-1] is True
+    assert "duplex" not in model._states
+
+
+def test_initial_empty_segment_marker_initializes_stream_without_audio():
+    model, token2wav = _model()
+    boundary = _info("duplex", 0, [])
+    boundary["meta"].update(
+        {
+            "code_flat_numel": 0,
+            "tts_is_last_chunk": True,
+            "turn_end": False,
+        }
+    )
+
+    output = _forward(model, [boundary])
+
+    assert output.multimodal_outputs["model_outputs"][0].numel() == 0
+    assert "duplex" in model._states
+    assert token2wav.hift.calls == []
+
+    resumed = _info(
+        "duplex",
+        1,
+        [4218, 4218, 4218, 10, 11, 12, 13, 14],
+    )
+    output = _forward(model, [resumed])
+
+    assert output.multimodal_outputs["model_outputs"][0].numel() > 0
+    assert "duplex" in model._states
+
+
+def test_shared_runtime_prompt_recreates_missing_file_before_second_owner(tmp_path, monkeypatch):
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+    model, _ = _model()
+    reference = torch.tensor([0.0, 0.25, -0.25, 0.0])
+
+    first = _info("voice-a", 0, [10, 11])
+    first["codes"]["ref"] = reference
+    first["meta"]["ref_audio_sr"] = 16000
+    first["meta"].pop("prompt_cache_id")
+    _forward(model, [first], request_ids=["internal-a"])
+
+    prompt_key = model._request_prompt_keys["internal-a"]
+    prompt_path = Path(model._runtime_prompts[prompt_key].path)
+    prompt_path.unlink()
+
+    second = _info("voice-b", 0, [12, 13])
+    second["codes"]["ref"] = reference
+    second["meta"]["ref_audio_sr"] = 16000
+    second["meta"].pop("prompt_cache_id")
+    _forward(model, [second], request_ids=["internal-b"])
+
+    assert prompt_path.is_file()
+    assert model._runtime_prompts[prompt_key].owners == {"internal-a", "internal-b"}
+
+    model.on_requests_finished(["internal-a"])
+    assert prompt_path.is_file()
+    assert model._runtime_prompts[prompt_key].owners == {"internal-b"}
+
+    model.on_requests_finished(["internal-b"])
+    assert not prompt_path.exists()
+    assert prompt_key not in model._runtime_prompts
+
+
+def test_runtime_prompt_write_failure_does_not_publish_partial_file(tmp_path, monkeypatch):
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+    model, _ = _model()
+    reference = torch.tensor([0.0, 0.25, -0.25, 0.0])
+
+    def fail_after_partial_write(path, *_args, **_kwargs):
+        Path(path).write_bytes(b"partial")
+        raise OSError("simulated write failure")
+
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav.sf.write",
+        fail_after_partial_write,
+    )
+
+    with pytest.raises(OSError, match="simulated write failure"):
+        model._materialize_runtime_prompt(reference, 16000)
+
+    assert len(model._runtime_prompts) == 1
+    entry = next(iter(model._runtime_prompts.values()))
+    assert not Path(entry.path).exists()
+    assert list(Path(entry.path).parent.iterdir()) == []
+
+
+def test_runtime_prompt_files_are_isolated_between_model_instances(tmp_path, monkeypatch):
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+    first_model, _ = _model()
+    second_model, _ = _model()
+    reference = torch.tensor([0.0, 0.25, -0.25, 0.0])
+
+    def runtime_ref_info(request_id: str):
+        info = _info(request_id, 0, [10, 11])
+        info["codes"]["ref"] = reference
+        info["meta"]["ref_audio_sr"] = 16000
+        info["meta"].pop("prompt_cache_id")
+        return info
+
+    _forward(first_model, [runtime_ref_info("voice-a")], request_ids=["internal-a"])
+    _forward(second_model, [runtime_ref_info("voice-b")], request_ids=["internal-b"])
+
+    first_key = first_model._request_prompt_keys["internal-a"]
+    second_key = second_model._request_prompt_keys["internal-b"]
+    first_path = Path(first_model._runtime_prompts[first_key].path)
+    second_path = Path(second_model._runtime_prompts[second_key].path)
+    assert first_key == second_key
+    assert first_path != second_path
+    assert first_path.is_file()
+    assert second_path.is_file()
+
+    first_model.on_requests_finished(["internal-a"])
+    assert not first_path.exists()
+    assert second_path.is_file()
+
+    second_model.on_requests_finished(["internal-b"])
+    assert not second_path.exists()
 
 
 def test_mixed_final_exact_buckets_keep_order_and_release_only_final_states():
@@ -313,6 +487,86 @@ def test_empty_final_ignores_generation_scheduler_placeholder_token():
 
     assert [audio.numel() for audio in output.multimodal_outputs["model_outputs"]] == [0, 0]
     assert model._states == {}
+
+
+@pytest.mark.parametrize(
+    "info",
+    [
+        # The runner injects the engine request id on every step (GPU
+        # _preprocess, NPU _gather_runtime_additional_information)...
+        {"request_id": "a", "meta": {"request_id": "a"}},
+        # ...but a pre-warm step can also reach the model with nothing at all.
+        {},
+    ],
+)
+def test_prewarm_placeholder_step_emits_silence_without_touching_state(info):
+    # async-chunk pre-warm submits Stage 2 with a reserved placeholder prompt.
+    # If it gets scheduled before the first codec window lands, those reserved
+    # tokens must neither be vocoded nor held to the codec payload contract.
+    model, token2wav = _model()
+
+    output = _forward(model, [info], request_ids=["a"])
+
+    assert output.multimodal_outputs["model_outputs"][0].numel() == 0
+    assert model._states == {}
+    assert token2wav.hift.calls == []
+
+
+def test_metadata_only_payload_still_decodes_codec_from_prompt_tokens():
+    # The connector strips 1-D codec tensors out of additional_information and
+    # leaves them in the prompt tokens, so a real chunk reaches the model as
+    # producer metadata plus input ids. It must still be vocoded.
+    model, _ = _model()
+    info = {
+        "request_id": "a",
+        "meta": {
+            "request_id": "a",
+            "chunk_seq": 0,
+            "code_flat_numel": 2,
+            "prompt_cache_id": "shared",
+        },
+    }
+
+    output = _forward(model, [info], placeholder_counts=[2])
+
+    assert output.multimodal_outputs["model_outputs"][0].numel() > 0
+    assert set(model._states) == {"a"}
+
+
+def test_non_final_chunk_shorter_than_lookahead_window_is_rejected():
+    token2wav = _FakeToken2Wav()
+    token2wav.flow.encoder.pre_lookahead_layer = SimpleNamespace(pre_lookahead_len=3)
+    adapter = BatchedToken2Wav(token2wav)
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(prompt, 1)
+
+    with pytest.raises(RuntimeError, match="chunk_below_lookahead_window"):
+        adapter.decode_batch(torch.tensor([[10]]), prompt, states, last_chunk=False)
+
+    # The final chunk is zero-padded by the encoder, so it stays decodable.
+    audios, _ = adapter.decode_batch(torch.tensor([[10]]), prompt, states, last_chunk=True)
+    assert len(audios) == 1
+
+
+def test_forward_builds_backend_when_weight_loading_was_skipped(monkeypatch):
+    # load_format=dummy never calls load_weights(), so Stage 2 would otherwise
+    # reach its first request with no Token2wav assets at all.
+    model = MiniCPMO45Code2Wav(vllm_config=_config())
+    token2wav = _FakeToken2Wav()
+    builds = 0
+
+    def build_backend():
+        nonlocal builds
+        builds += 1
+        model.backend = BatchedToken2Wav(token2wav)
+
+    monkeypatch.setattr(model, "_build_backend", build_backend)
+
+    output = _forward(model, [_info("a", 0, [10, 11])])
+    _forward(model, [_info("a", 1, [12, 13])])
+
+    assert builds == 1
+    assert output.multimodal_outputs["model_outputs"][0].numel() > 0
 
 
 @pytest.mark.parametrize(
@@ -405,27 +659,37 @@ def test_reference_voice_and_duplex_metadata_follow_request_lifecycle():
     model, _ = _model()
     first = _info("voice-a", 0, [1, 2])
     first["codes"]["ref"] = torch.linspace(-0.1, 0.1, 160)
+    segment_text_utf8 = torch.tensor(list(b"hello"), dtype=torch.uint8)
     first["meta"].update(
         ref_audio_sr=16000,
-        native_duplex_segment_text="hello",
+        llm_output_text_utf8=segment_text_utf8,
         duplex_turn_id=7,
         duplex_epoch=3,
     )
     first["meta"].pop("prompt_cache_id")
 
     output = _forward(model, [first])
-    prompt_cache_id, prompt_wav = model._owned_prompt_wavs["voice-a"]
-    assert prompt_cache_id.startswith("voice-a:")
+    prompt_key = model._request_prompt_keys["voice-a"]
+    prompt = model._runtime_prompts[prompt_key]
+    prompt_cache_id, prompt_wav = prompt.cache_id, prompt.path
+    assert prompt_cache_id.startswith("runtime-ref-")
     assert Path(prompt_wav).is_file()
-    assert bytes(output.multimodal_outputs["meta.llm_output_text_utf8"][0].tolist()).decode() == "hello"
+    torch.testing.assert_close(
+        output.multimodal_outputs["meta.llm_output_text_utf8"][0],
+        segment_text_utf8,
+    )
     assert output.multimodal_outputs["meta.duplex_turn_id"][0].item() == 7
     assert output.multimodal_outputs["meta.duplex_epoch"][0].item() == 3
 
     final = _info("voice-a", 1, [3, 4], last_chunk=True)
     final["meta"].pop("prompt_cache_id")
+    final["meta"]["tts_is_last_chunk"] = True
     output = _forward(model, [final])
 
     assert output.multimodal_outputs["meta.tts_is_last_chunk"][0].item() is True
-    assert "voice-a" not in model._owned_prompt_wavs
+    assert model._request_prompt_keys["voice-a"] == prompt_key
+    model.on_requests_finished(["voice-a"])
+    assert "voice-a" not in model._request_prompt_keys
+    assert prompt_key not in model._runtime_prompts
     assert not Path(prompt_wav).exists()
     assert (prompt_cache_id, prompt_wav) not in model.backend._prompt_features

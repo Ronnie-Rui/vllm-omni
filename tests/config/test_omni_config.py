@@ -81,6 +81,21 @@ def _from_pipeline_key(
     )
 
 
+def test_duplex_session_capacity_propagates_to_every_structured_stage() -> None:
+    omni_config = _from_pipeline_key("personaplex")
+
+    assert [stage.model_config.duplex_max_sessions for stage in omni_config.stage_configs] == [2, 2]
+
+
+def test_non_duplex_deploy_keeps_model_session_capacity_at_one(tmp_path: Path) -> None:
+    deploy_path = tmp_path / "personaplex-turn.yaml"
+    deploy_path.write_text("session_mode: turn\n", encoding="utf-8")
+
+    omni_config = _from_pipeline_key("personaplex", deploy_config_path=str(deploy_path))
+
+    assert [stage.model_config.duplex_max_sessions for stage in omni_config.stage_configs] == [1, 1]
+
+
 @pytest.mark.parametrize("model_type", sorted(OMNI_PIPELINES))
 def test_vllm_omni_config_from_pipeline_config_matches_merge_pipeline_deploy(model_type: str):
     pipeline = _resolve_pipeline_or_skip(model_type)
@@ -105,6 +120,7 @@ def test_vllm_omni_config_from_pipeline_config_matches_merge_pipeline_deploy(mod
         assert omni_stage.runtime_config.num_replicas == legacy_stage.yaml_runtime.get("num_replicas", 1)
 
         engine_args = legacy_stage.yaml_engine_args
+        assert omni_stage.model_config.duplex_max_sessions == engine_args.get("duplex_max_sessions", 1)
         assert omni_stage.model_config.enforce_eager == engine_args.get("enforce_eager", False)
         assert omni_stage.load_config.load_format == engine_args.get("load_format", "auto")
         assert omni_stage.load_config.tokenizer_mode == engine_args.get("tokenizer_mode", "auto")
@@ -379,6 +395,7 @@ def test_runtime_config_fields_match_rfc_runtime_scope():
 def test_sub_config_fields_match_rfc_scopes():
     assert {f.name for f in fields(OmniStageModelConfig)} == {
         "active_stream_window",
+        "duplex_max_sessions",
         "enable_sleep_mode",
         "default_sampling_params",
         "subtalker_sampling_params",
@@ -392,6 +409,11 @@ def test_sub_config_fields_match_rfc_scopes():
         "enable_multithread_weight_load",
         "num_weight_load_threads",
         "disable_autocast",
+        # Per-stage checkpoint resolution for repos whose stages live in
+        # subfolders (e.g. Audex): mirrors StagePipelineConfig on the
+        # legacy engine-args path.
+        "model_subdir",
+        "tokenizer_subdir",
     }
     assert {f.name for f in fields(OmniStageLoadConfig)} == {
         "load_format",
@@ -431,9 +453,11 @@ def test_sub_config_fields_match_rfc_scopes():
         "sequence_parallel_size",
         "ulysses_degree",
         "ring_degree",
+        "allgather_degree",
         "ulysses_mode",
         "cfg_parallel_size",
         "vae_patch_parallel_size",
+        "text_encoder_tp_size",
         "vae_parallel_mode",
         "use_hsdp",
         "mask_sp_padding",
@@ -547,9 +571,40 @@ def test_from_pipeline_config_derives_sequence_parallel_size_from_degrees(tmp_pa
     assert stage.parallel_config.world_size == 6
 
 
-def test_diffusion_parallel_config_rejects_cfg_parallel_size_outside_current_bound():
+def test_from_pipeline_config_derives_sequence_parallel_size_from_allgather_degree(tmp_path):
+    deploy_path = tmp_path / "dreamzero_allgather_parallel.yaml"
+    deploy_path.write_text(
+        "\n".join(
+            [
+                "pipeline: dreamzero",
+                "async_chunk: false",
+                "stages:",
+                "  - stage_id: 0",
+                "    parallel_config:",
+                "      sequence_parallel_size: 99",
+                "      allgather_degree: 2",
+            ]
+        )
+    )
+
+    stage = _from_pipeline_key("dreamzero", deploy_config_path=str(deploy_path)).stage_by_id(0)
+
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.parallel_config.allgather_degree == 2
+    assert stage.parallel_config.sequence_parallel_size == 2
+    assert stage.parallel_config.world_size == 2
+
+
+def test_diffusion_parallel_config_accepts_four_way_guidance_parallelism():
+    cfg = OmniStageDiffusionParallelConfig(cfg_parallel_size=4)
+
+    assert cfg.cfg_parallel_size == 4
+    assert cfg.world_size == 4
+
+
+def test_diffusion_parallel_config_rejects_allgather_with_ulysses_or_ring():
     with pytest.raises(ValidationError):
-        OmniStageDiffusionParallelConfig(cfg_parallel_size=4)
+        OmniStageDiffusionParallelConfig(allgather_degree=2, ulysses_degree=2)
 
 
 def test_stage_realizations_use_stage_specific_parallel_config_types():
@@ -596,6 +651,47 @@ def test_from_pipeline_config_preserves_diffusion_parallel_mask_sp_padding(tmp_p
 
     assert isinstance(stage, VllmOmniDiffusionStageConfig)
     assert stage.parallel_config.mask_sp_padding is True
+
+
+def test_from_pipeline_config_routes_regional_compile_dynamic(tmp_path):
+    deploy_path = tmp_path / "dreamzero_compile.yaml"
+    deploy_path.write_text(
+        "\n".join(
+            [
+                "pipeline: dreamzero",
+                "async_chunk: false",
+                "stages:",
+                "  - stage_id: 0",
+                "    diffusion_compile_granularity: regional",
+                "    diffusion_compile_dynamic: false",
+            ]
+        )
+    )
+
+    configured_stage = _from_pipeline_key("dreamzero", deploy_config_path=str(deploy_path)).stage_by_id(0)
+    overridden_stage = _from_pipeline_key(
+        "dreamzero",
+        deploy_config_path=str(deploy_path),
+        cli_overrides={
+            "diffusion_compile_granularity": "full",
+            "diffusion_compile_dynamic": True,
+        },
+    ).stage_by_id(0)
+
+    assert configured_stage.diffusion_config.diffusion_compile_granularity == "regional"
+    assert configured_stage.diffusion_config.diffusion_compile_dynamic is False
+    assert overridden_stage.diffusion_config.diffusion_compile_granularity == "full"
+    assert overridden_stage.diffusion_config.diffusion_compile_dynamic is True
+
+
+def test_structured_diffusion_config_rejects_non_boolean_compile_dynamic():
+    with pytest.raises(ValidationError, match="diffusion_compile_dynamic"):
+        omni_config_module._DiffusionConfigProjection(diffusion_compile_dynamic="false")
+
+
+def test_structured_diffusion_config_rejects_invalid_compile_granularity():
+    with pytest.raises(ValidationError, match="diffusion_compile_granularity"):
+        omni_config_module._DiffusionConfigProjection(diffusion_compile_granularity="block")
 
 
 def test_from_pipeline_config_matches_stage_config_to_omegaconf_behavior_for_representative_stage():

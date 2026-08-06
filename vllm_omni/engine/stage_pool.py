@@ -25,7 +25,7 @@ from vllm_omni.engine.stage_client import (
     StagePoolDiffusionClient,
     StagePoolLLMClient,
 )
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt
 from vllm_omni.metrics import (
     count_audio_frames,
     count_image_pixels,
@@ -938,8 +938,7 @@ class StagePool:
         )
 
         enabled = diffusion_batch_invariant_enabled()
-        if not isinstance(params, OmniDiffusionSamplingParams):
-            params = OmniDiffusionSamplingParams(seed=getattr(params, "seed", None) if enabled else None)
+        params = OmniDiffusionSamplingParams.from_params(params)
         validate_batch_invariant_diffusion_seed(params, request_id=request_id)
         # Give each dispatch its own params so a stage initializing the
         # generator in place cannot leak that state into the next dispatch.
@@ -958,8 +957,7 @@ class StagePool:
     ) -> int:
         """Submit a stage-entry request into this pool."""
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
-        # Convert plain vllm SamplingParams for single-stage diffusion models
-        # that receive sampling params from the user/caller directly.
+        # Direct engine callers may provide plain vLLM SamplingParams.
         if self.stage_type == "diffusion":
             params = self._prepare_diffusion_params(params, request_id=request_id)
         submit_kwargs = dict(submit_kwargs or {})
@@ -1069,6 +1067,24 @@ class StagePool:
                 raise
         return replica_id
 
+    async def submit_interaction(
+        self,
+        request_id: str,
+        interaction: OmniInteractionPrompt,
+    ) -> int:
+        """Submit a midway interaction to an active diffusion (typically video generation) request."""
+        replica_id = self.get_bound_replica_id(request_id)
+        if replica_id is None or self.clients[replica_id] is None:
+            replica_id = await self._pick_or_select(request_id)
+
+        client = self._diffusion_client(replica_id)
+        result = await client.submit_interaction_async(request_id, interaction)
+        # Interaction may raise error if underlying check against ODConfig fails.
+        if isinstance(result, dict) and result.get("error"):
+            reason = result.get("reason") or "Unknown interaction RPC error"
+            raise ValueError(str(reason))
+        return replica_id
+
     async def _pick_or_select(
         self,
         request_id: str,
@@ -1085,7 +1101,11 @@ class StagePool:
     async def _poll_stage_raw(self, client: StagePoolLLMClient) -> EngineCoreOutputs | None:
         """Pull raw EngineCoreOutputs from a stage replica without processing."""
         outputs = await client.get_output_async()
-        if not outputs.outputs:
+        # Keep scheduler-only / finished-only batches. Omni schedulers mirror
+        # upstream by emitting SchedulerStats on throttled ticks even when no
+        # request output is produced, and dropping those batches loses KV/queue
+        # gauges for that interval.
+        if not outputs.outputs and outputs.scheduler_stats is None and not outputs.finished_requests:
             return None
         return outputs
 
@@ -1101,7 +1121,6 @@ class StagePool:
             return []
         client = cast(StagePoolLLMClient, raw_client)
         processor = self.output_processor
-        iteration_stats = IterationStats()
         processed = processor.process_outputs(
             raw_outputs.outputs,
             raw_outputs.timestamp,
