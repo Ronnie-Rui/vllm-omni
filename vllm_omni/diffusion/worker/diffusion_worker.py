@@ -73,7 +73,10 @@ def _initialize_batch_invariance(device: torch.device) -> None:
     if not diffusion_batch_invariant_enabled():
         return
     if device.type != "cuda" or torch.version.hip is not None:
-        raise RuntimeError("Diffusion batch invariance currently requires an NVIDIA CUDA device.")
+        # ROCm/HIP and non-CUDA devices skip silently: no operator replacement, no
+        # notice. vLLM registers its batch-invariant overrides on the CUDA dispatch
+        # key only, so there is nothing to install here.
+        return
 
     capability = torch.cuda.get_device_capability(device)
     if capability < (8, 0):

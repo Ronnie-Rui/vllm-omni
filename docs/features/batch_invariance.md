@@ -28,19 +28,23 @@ vLLM's own batch invariance guide; this page covers the diffusion stage.
 Diffusion batch invariance requires an NVIDIA CUDA GPU with compute capability 8.0
 (SM80, Ampere) or newer. This matches vLLM's requirement.
 
-These are enforced in code and raise `RuntimeError` at worker startup:
+Unsupported hardware is handled in two different ways at worker startup:
 
-- non-CUDA devices are rejected;
-- ROCm/HIP builds are rejected, because vLLM registers its batch-invariant operator
-  overrides on the CUDA dispatch key only — on ROCm the switch would appear to work
-  while the original operators kept running;
-- compute capability below 8.0 is rejected.
+- **ROCm/HIP builds and non-CUDA devices skip silently.** No operator replacement happens
+  and no message is emitted: the switch is accepted, and the diffusion stage runs with the
+  original operators. vLLM registers its batch-invariant operator overrides on the CUDA
+  dispatch key only, so there is nothing to install on these devices.
+- **CUDA compute capability below 8.0 raises `RuntimeError`.**
 
-The last one deserves a word. vLLM does not merely skip unsupported hardware: it
-*branches* on capability, installing Triton persistent-matmul overrides on SM80 and
-relying on cuBLAS workspace configuration on SM90/SM100. Hardware below SM80 falls into
-the newer-GPU branch, whose assumptions do not hold there. Failing at startup is
-deliberate — a silent fallback would return plausible images with no determinism.
+Because the silent skip produces no diagnostic, do not infer determinism from a clean
+startup on ROCm — batch invariance is simply not in effect there.
+
+The SM80 floor deserves a word on why it fails loudly instead. vLLM does not merely skip
+unsupported hardware: it *branches* on capability, installing Triton persistent-matmul
+overrides on SM80 and relying on cuBLAS workspace configuration on SM90/SM100. Hardware
+below SM80 falls into the newer-GPU branch, whose assumptions do not hold there. Failing at
+startup is deliberate — a silent fallback would return plausible images with no
+determinism.
 
 ## Enabling Batch Invariance
 
@@ -54,7 +58,7 @@ Two environment variables control the diffusion stage:
 Leave the diffusion-only variable unset unless you need the two stages to differ. It
 exists because a mixed AR + diffusion pipeline may want deterministic text generation
 without pinning the diffusion stage to the narrow validated recipe below — or may need
-to opt out on hardware the diffusion side rejects.
+to opt out on hardware the diffusion side does not support.
 
 An unparsable value raises `ValueError` listing the accepted values, rather than
 defaulting to off. A typo that silently disabled determinism would be worse than a crash.
@@ -198,7 +202,8 @@ When the diffusion stage runs batch-invariant, vLLM-Omni:
 1. resolves the three-state switch during worker startup, after the CUDA device is
    selected and before distributed initialization — the ordering matters because vLLM's
    initialization writes NCCL environment variables that a live communicator would ignore;
-2. checks the hardware requirements above and fails closed;
+2. checks the hardware requirements above — returning silently on ROCm/non-CUDA devices,
+   raising below SM80 — so steps 3 and 4 are skipped entirely on unsupported devices;
 3. calls vLLM's `init_batch_invariance()`, which installs deterministic operator
    implementations, disables split-k and reduced-precision reductions, forces IEEE fp32
    precision for matmul and cuDNN convolution, and pins NCCL to deterministic algorithms;
