@@ -21,6 +21,10 @@ from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from vllm_omni.diffusion.batch_invariance import (
+    validate_batch_invariant_sd3_config,
+    validate_batch_invariant_sd3_request,
+)
 from vllm_omni.diffusion.data import (
     DiffusionOutput,
     DiffusionRequestAbortedError,
@@ -184,6 +188,7 @@ class DiffusionEngine:
                 from the resolved execution mode.
         """
         self.od_config = od_config
+        validate_batch_invariant_sd3_config(od_config)
 
         self._init_process_hooks(od_config)
         self.execution_mode = self._resolve_execution_mode(od_config)
@@ -690,6 +695,7 @@ class DiffusionEngine:
         return engine
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
+        validate_batch_invariant_sd3_request(request)
         with self._cv:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
@@ -742,6 +748,11 @@ class DiffusionEngine:
         return final_output
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        validate_batch_invariant_sd3_request(request)
+        return self._add_req_and_wait_for_response(request)
+
+    def _add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        """Unchecked synchronous core used by the validated wrapper and startup warmup."""
         with self._rpc_lock:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
@@ -887,7 +898,7 @@ class DiffusionEngine:
         )
         logger.info("dummy run to warm up the model")
         request = self.pre_process_func(req) if self.pre_process_func is not None else req
-        output = self.add_req_and_wait_for_response(request)
+        output = self._add_req_and_wait_for_response(request)
         if output.error:
             raise RuntimeError(f"Dummy run failed: {output.error}")
 

@@ -3,9 +3,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
+from vllm_omni.diffusion.batch_invariance import validate_batch_invariant_diffusion_seed
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 DUMMY_DIFFUSION_REQUEST_ID = "dummy_req_id"
@@ -30,11 +31,20 @@ class OmniDiffusionRequest:
     sampling_params: OmniDiffusionSamplingParams
     request_id: str
     kv_sender_info: dict[str, Any] | None = None
+    seed_was_explicit: bool = field(init=False, repr=False)
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""
         if not isinstance(self.request_id, str) or not self.request_id:
             raise ValueError("OmniDiffusionRequest.request_id must be a non-empty string.")
+
+        self.seed_was_explicit = self.sampling_params.seed is not None
+
+        # Must run before the fallback below, which would otherwise hide a missing
+        # seed behind a random one. Internal warmup requests are exempt: they are
+        # constructed by the engine itself and legitimately rely on that fallback.
+        if not self.is_dummy_run():
+            validate_batch_invariant_diffusion_seed(self.sampling_params, request_id=self.request_id)
 
         # When neither a generator nor a seed is provided, assign a random seed
         # so that all ranks derive the same generator state.
