@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
 import os
 from collections.abc import Iterator
 
@@ -157,19 +158,31 @@ def test_worker_bootstrap_is_noop_when_batch_invariance_is_disabled(
     diffusion_worker_module._initialize_batch_invariance(torch.device("cpu"))
 
 
-def test_worker_bootstrap_rejects_non_cuda_device(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_worker_bootstrap_skips_non_cuda_device_silently(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: pytest.fail())
 
-    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+    with caplog.at_level(logging.DEBUG):
         diffusion_worker_module._initialize_batch_invariance(torch.device("cpu"))
 
+    assert caplog.records == []
 
-def test_worker_bootstrap_rejects_rocm_cuda_device(monkeypatch: pytest.MonkeyPatch) -> None:
+
+def test_worker_bootstrap_skips_rocm_cuda_device_silently(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
     monkeypatch.setattr(torch.version, "hip", "6.0")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: pytest.fail())
 
-    with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
+    with caplog.at_level(logging.DEBUG):
         diffusion_worker_module._initialize_batch_invariance(torch.device("cuda", 0))
+
+    assert caplog.records == []
 
 
 def test_worker_bootstrap_rejects_below_sm80_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
