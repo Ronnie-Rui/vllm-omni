@@ -4,6 +4,7 @@
 import random
 
 import pytest
+import vllm.envs as envs
 
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -72,3 +73,36 @@ def test_tp_seed_same_across_ranks_and_varies_across_requests():
 
     # Seeds must vary across requests (non-determinism preserved).
     assert len(set(seeds)) == n_requests, f"Expected {n_requests} unique seeds but got {len(set(seeds))}: {seeds}"
+
+
+def test_request_records_whether_seed_was_explicit_before_defaulting():
+    implicit = _make_request()
+    explicit = OmniDiffusionRequest(
+        prompt="test",
+        sampling_params=OmniDiffusionSamplingParams(seed=0),
+        request_id="request-explicit",
+    )
+
+    assert implicit.seed_was_explicit is False
+    assert explicit.seed_was_explicit is True
+
+
+def test_construction_rejects_missing_seed_in_batch_invariant_mode(monkeypatch):
+    """The contract has to fire before __post_init__ hides the gap behind a random seed."""
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+
+    with pytest.raises(ValueError, match="requires an explicit integer seed"):
+        _make_request()
+
+
+def test_dummy_warmup_request_still_uses_internal_seed_fallback_in_batch_invariant_mode(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+
+    request = OmniDiffusionRequest(
+        prompt={"prompt": "dummy run"},
+        sampling_params=OmniDiffusionSamplingParams(),
+        request_id=DUMMY_DIFFUSION_REQUEST_ID,
+    )
+
+    assert request.is_dummy_run()
+    assert isinstance(request.sampling_params.seed, int)

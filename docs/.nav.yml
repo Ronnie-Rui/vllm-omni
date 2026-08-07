@@ -74,6 +74,7 @@ nav:
       - Custom Pipeline: features/custom_pipeline.md
       - Request-Level Batching: user_guide/diffusion/request_batching.md
       - Step Execution: user_guide/diffusion/step_execution.md
+      - Batch Invariance: features/batch_invariance.md
     - Quantization:
       - Overview: user_guide/quantization/overview.md
       - Online Quantization: user_guide/quantization/online.md
