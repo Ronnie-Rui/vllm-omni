@@ -25,26 +25,32 @@ vLLM's own batch invariance guide; this page covers the diffusion stage.
 
 ## Hardware Requirements
 
-Diffusion batch invariance requires an NVIDIA CUDA GPU with compute capability 8.0
-(SM80, Ampere) or newer. This matches vLLM's requirement.
+Evidence covers exactly one NVIDIA CUDA compute capability: **8.9** (SM89, Ada — measured
+on an RTX 4090). No other capability has been measured.
 
-Unsupported hardware is handled in two different ways at worker startup:
+The worker does not check compute capability. Any other CUDA GPU is **unverified, not
+rejected**: the switch is honoured, the engine runs, and determinism holds only for the
+operators vLLM actually replaces. Verifying your own hardware is up to you.
 
-- **ROCm/HIP builds and non-CUDA devices skip silently.** No operator replacement happens
-  and no message is emitted: the switch is accepted, and the diffusion stage runs with the
-  original operators. vLLM registers its batch-invariant operator overrides on the CUDA
-  dispatch key only, so there is nothing to install on these devices.
-- **CUDA compute capability below 8.0 raises `RuntimeError`.**
+Do not read that as "newer is safer". vLLM *branches* on capability rather than requiring a
+floor — in `vllm/model_executor/layers/batch_invariant.py` the Triton persistent-matmul
+overrides for `mm`, `addmm`, `matmul` and `linear` are installed on the SM8x family only,
+while other families take a different path. A result measured in one capability bracket
+therefore says nothing about another.
 
-Because the silent skip produces no diagnostic, do not infer determinism from a clean
-startup on ROCm — batch invariance is simply not in effect there.
+One negative result is already known: **on SM120 (compute capability 12.0, RTX 5090) batch
+invariance does not hold.** That is an observed failure, not a prediction — identical
+requests diverge across batch sizes with the switch on. Do not use SM120 for work that
+depends on reproducible latents.
 
-The SM80 floor deserves a word on why it fails loudly instead. vLLM does not merely skip
-unsupported hardware: it *branches* on capability, installing Triton persistent-matmul
-overrides on SM80 and relying on cuBLAS workspace configuration on SM90/SM100. Hardware
-below SM80 falls into the newer-GPU branch, whose assumptions do not hold there. Failing at
-startup is deliberate — a silent fallback would return plausible images with no
-determinism.
+ROCm/HIP builds and non-CUDA devices skip silently: no operator replacement happens and no
+message is emitted, so the diffusion stage runs with the original operators. vLLM registers
+its batch-invariant overrides on the CUDA dispatch key only, so there is nothing to install
+there. Because that skip produces no diagnostic, do not infer determinism from a clean
+startup on ROCm — batch invariance is simply not in effect.
+
+If a device is not one you have validated, the supported way out is to turn the feature off
+(`VLLM_OMNI_DIFFUSION_BATCH_INVARIANT=0`) rather than to assume the kernels carried over.
 
 ## Enabling Batch Invariance
 
@@ -202,8 +208,8 @@ When the diffusion stage runs batch-invariant, vLLM-Omni:
 1. resolves the three-state switch during worker startup, after the CUDA device is
    selected and before distributed initialization — the ordering matters because vLLM's
    initialization writes NCCL environment variables that a live communicator would ignore;
-2. checks the hardware requirements above — returning silently on ROCm/non-CUDA devices,
-   raising below SM80 — so steps 3 and 4 are skipped entirely on unsupported devices;
+2. returns silently on ROCm/non-CUDA devices, so steps 3 and 4 are skipped entirely there;
+   compute capability is not checked, so every CUDA device proceeds;
 3. calls vLLM's `init_batch_invariance()`, which installs deterministic operator
    implementations, disables split-k and reduced-precision reductions, forces IEEE fp32
    precision for matmul and cuDNN convolution, and pins NCCL to deterministic algorithms;

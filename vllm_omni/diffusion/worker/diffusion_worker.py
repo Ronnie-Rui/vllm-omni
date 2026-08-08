@@ -70,13 +70,11 @@ def _initialize_batch_invariance(device: torch.device) -> None:
         # key only, so there is nothing to install here.
         return
 
-    capability = torch.cuda.get_device_capability(device)
-    if capability < (8, 0):
-        raise RuntimeError(
-            "Diffusion batch invariance requires SM80 or newer (CUDA compute capability >= 8.0); "
-            f"device {device} has {capability[0]}.{capability[1]}."
-        )
-
+    # CUDA compute capability is deliberately not checked. Evidence covers 8.9 only,
+    # and upstream branches per capability family, so any other value is unverified
+    # rather than unsupported: the switch is honoured and determinism holds for the
+    # operators vLLM actually replaces. docs/features/batch_invariance.md carries the
+    # per-capability scope; VLLM_OMNI_DIFFUSION_BATCH_INVARIANT=0 is the way out.
     from vllm.model_executor.layers.batch_invariant import init_batch_invariance
 
     # init_batch_invariance() re-reads envs.VLLM_BATCH_INVARIANT itself, so the
