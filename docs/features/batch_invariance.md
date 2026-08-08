@@ -65,7 +65,7 @@ Two environment variables control the diffusion stage:
 Leave the diffusion-only variable unset unless you need the two stages to differ. It
 exists because a mixed AR + diffusion pipeline may want deterministic text generation
 without subjecting the diffusion stage to the [seed contract](#seed-contract) below — or
-may need to opt out on hardware the diffusion side does not support.
+may need to opt out on hardware where the diffusion side has no verified evidence.
 
 An unparsable value raises `ValueError` listing the accepted values, rather than
 defaulting to off. A typo that silently disabled determinism would be worse than a crash.
@@ -186,26 +186,41 @@ Reduction order — the usual source of batch-dependent numerics in collectives 
 vary because there is no reduction. So the single-GPU runs never exercise the code whose
 determinism multi-GPU determinism would rest on.
 
-### Why only SD3
+### Why only SD3 has evidence
 
-The first capability check pins `model_class_name` to `StableDiffusion3Pipeline`, so all
-other pipelines in `vllm_omni/diffusion/models/` — 43 of them — fail closed. That is an
-operator-coverage decision, not a preference for SD3:
+`StableDiffusion3Pipeline` is the only pipeline a bit-identity run covers. Every other
+pipeline under `vllm_omni/diffusion/models/` is **unverified, not rejected** — nothing stops
+it from running with batch invariance on, and nothing vouches for its output either. That
+the measured one is SD3 follows from operator coverage rather than from a preference for
+SD3, and the same coverage gaps are why the other families have not been measured:
 
 - **Video pipelines add `Conv3d`.** `vllm_omni/diffusion` contains 71 `Conv3d` mentions
   (66 of them under `models/`). vLLM's batch-invariant layer overrides none of it: in
   `vllm/model_executor/layers/batch_invariant.py`, both vLLM trees checked here match
-  `conv1d|conv3d|convolution|group_norm|scaled_dot_product` zero times.
+  `conv1d|conv3d|convolution|scaled_dot_product` zero times.
 - **Audio pipelines add `Conv1d`** — 70 mentions under `vllm_omni/diffusion` — with the
   same zero coverage upstream.
-- **Video is harder still.** `vllm_omni/diffusion/models/lance/wan_vae.py` defines
-  `CausalConv3d` as a "Causal 3D conv with feature-map caching across temporal chunks".
-  Carrying cache state across temporal chunks means the per-sample decode that SD3 gets
-  from `vae_use_slicing=True` does not translate: a sample's output depends on chunk
-  state, not on the sample alone.
+- **`group_norm` is a separate, image-side gap.** It is also unoverridden upstream, but it
+  is not what keeps video out: all 23 `GroupNorm` sites under `vllm_omni/diffusion` sit in
+  image-side VAEs and UNets, and `wan_vae.py` contains none — it normalizes with its own
+  `RMS_norm` instead. SD3 is exempt only because the recipe fixes the shapes its own
+  normalization sees; see [Known Limitations](#known-limitations).
+- **Video's temporal path carries an extra unmeasured risk — though not the one the cache
+  suggests.** `vllm_omni/diffusion/models/lance/wan_vae.py` defines `CausalConv3d` as a
+  "Causal 3D conv with feature-map caching across temporal chunks", and decodes one
+  temporal slice at a time while threading a `feat_cache` list through those layers. That
+  state does not couple samples: `encode()` and `decode()` each call `clear_cache()` on
+  entry (`wan_vae.py:563`, `:588`) and again on exit (`:584`, `:606`), the loop slices only
+  the temporal axis (`x[:, :, i : i + 1, :, :]`) with the batch dimension untouched, and
+  `feat_idx` indexes convolutions rather than requests. The chunk loop is therefore a
+  deterministic sequential dependency along time — order-sensitive, not
+  batch-composition-sensitive. Video is still the one to leave alone, for the two reasons
+  above it: `Conv3d` has no batch-invariant kernel upstream, and this temporal path has
+  never been measured.
 
-Lifting the pipeline gate therefore waits on upstream batch-invariant convolution and
-attention kernels, not on more testing here.
+Extending the evidence to those pipelines therefore waits on upstream batch-invariant
+convolution and attention kernels, not on more testing here: until those land, a run on
+them could only ever record whether one shape happened to come out bit-identical.
 
 ### What multi-GPU would need audited
 
@@ -251,6 +266,20 @@ built from convolutions and group normalization. Their batch invariance is there
 guaranteed by the kernel layer — it is a property of the specific shapes the validated
 recipe happens to produce. Change the resolution and the convolution shapes change with
 it, which is why 512 × 512 is listed as measured rather than as a supported range.
+
+**Determinism claims extend only as far as the override list.** An operator absent from
+that list is not thereby non-deterministic — it is simply unguaranteed, and each case has
+to be argued separately. `RMS_norm` in `vllm_omni/diffusion/models/lance/wan_vae.py:68`
+is the instructive example: it calls `F.normalize(x, dim=1)`, which lowers to
+`linalg_vector_norm`, and upstream's reduction-operator list does not include it. By
+inspection it is nevertheless batch-invariant, because the reduction axis is the channel
+dimension: every output element at `(b, c, h, w)` depends only on the `C` values sharing
+its `(b, h, w)`, and that reduction length is fixed by the weight shape rather than by how
+many requests are in flight. This is an analytical result, not a measured one — no
+bit-identity run covers it, and it is not on upstream's guaranteed list. One residual
+question is left open: if a split-reduction heuristic ever partitioned the channel axis as
+a function of total tensor size rather than channel count, batch composition could re-enter
+through the back door. That has not been measured either, and is judged unlikely.
 
 Closing the gap requires batch-invariant implementations of those three operators in
 vLLM, which is upstream work. Until then:
