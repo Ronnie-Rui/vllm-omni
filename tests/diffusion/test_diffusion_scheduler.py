@@ -712,7 +712,7 @@ class TestDiffusionEngine:
         engine = DiffusionEngine.__new__(DiffusionEngine)
         engine.od_config = SimpleNamespace(model_class_name="mock_model", diffusion_load_format="default")
         engine.pre_process_func = None
-        engine._add_req_and_wait_for_response = mocker.Mock(return_value=DiffusionOutput(error="boom"))
+        engine.add_req_and_wait_for_response = mocker.Mock(return_value=DiffusionOutput(error="boom"))
 
         with pytest.raises(RuntimeError, match="Dummy run failed: boom"):
             engine._dummy_run()

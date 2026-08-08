@@ -2,7 +2,8 @@
 
 !!! note
     Diffusion batch invariance is experimental. It currently has evidence for a single
-    Stable Diffusion 3 configuration on one GPU. See
+    Stable Diffusion 3 configuration on one GPU. Other configurations are **not
+    rejected** — they run, just without that evidence. See
     [Known Limitations](#known-limitations) for the operator gaps behind that narrow scope.
 
 Batch invariance means a request produces bit-identical output regardless of the batch
@@ -63,8 +64,8 @@ Two environment variables control the diffusion stage:
 
 Leave the diffusion-only variable unset unless you need the two stages to differ. It
 exists because a mixed AR + diffusion pipeline may want deterministic text generation
-without pinning the diffusion stage to the narrow validated recipe below — or may need
-to opt out on hardware the diffusion side does not support.
+without subjecting the diffusion stage to the [seed contract](#seed-contract) below — or
+may need to opt out on hardware the diffusion side does not support.
 
 An unparsable value raises `ValueError` listing the accepted values, rather than
 defaulting to off. A typo that silently disabled determinism would be worse than a crash.
@@ -102,6 +103,20 @@ rejected up front with the request id in the message. A `generator` object is re
 because it binds to one device and does not travel across worker processes, so ranks
 could not be shown to share an RNG identity.
 
+Three further inputs are rejected for the same reason — each would take the RNG identity
+out of the seed's hands:
+
+| Rejected input | Why |
+| --- | --- |
+| `generator_device` | selects the device the RNG is drawn on, so the seed no longer fixes the draw |
+| `latents` | supplies the initial noise directly, so the seed does not determine it at all |
+| `sigmas` | replaces the noise schedule, so the seeded trajectory follows a different path |
+
+These are the *only* request-level rejections in batch-invariant mode. They are not recipe
+constraints — they are the premise of "same seed ⇒ same output" itself, which is why they
+stay while the configuration checks do not (see
+[The table is evidence, not a gate](#the-table-is-evidence-not-a-gate)).
+
 The check runs in `OmniDiffusionRequest.__post_init__`, immediately before the random-seed
 fallback it guards, so it covers every construction path rather than only requests that
 enter through the engine. Internal warmup requests are exempt: they are built by the
@@ -109,14 +124,15 @@ engine itself and legitimately rely on that fallback.
 
 ## Tested Configurations
 
-Batch invariance has been verified on exactly one diffusion configuration:
+This section records **what has been measured**, not what the engine permits. Batch
+invariance has been verified on exactly one diffusion configuration:
 
 | Dimension | Validated value |
 | --- | --- |
 | Pipeline | `StableDiffusion3Pipeline` |
 | Attention backend | `TORCH_SDPA` |
 | Resolution | 512 × 512 |
-| Inference steps | 8 (the only measured value; other step counts are not gated) |
+| Inference steps | 8 (the only measured value) |
 | dtype | `torch.bfloat16` |
 
 Engine settings used for that run: single GPU (`num_gpus=1`), `enforce_eager=True`,
@@ -135,21 +151,40 @@ Reproduce with:
 python examples/offline_inference/text_to_image/sd3_batch_invariance_gpu.py
 ```
 
-While batch invariance is enabled, the engine fails closed on anything outside this
-tuple, **with one exception — the step count**: `DiffusionEngine.__init__` raises
-`ValueError` listing every unsupported engine setting, and `add_request` does the same for
-per-request parameters such as pipeline, attention backend and resolution. Those
-dimensions determine convolution and attention shapes, so a change there can silently
-break invariance; the gate reports them as unsupported rather than returning
-non-deterministic output.
+### The table is evidence, not a gate
 
-`num_inference_steps` is deliberately not gated. It is a loop count and changes no tensor
-shape, so extra steps cannot break the per-step invariance the kernels provide. Only 8
-steps have been measured, so any other count is unverified rather than rejected — it runs,
-and verifying it is up to you. Other resolutions and pipelines may well be
-batch-invariant too; they are simply unverified *and* still gated, because there the
-failure would be silent. If you validate another configuration, please report it so this
-table and the gate can grow together.
+**vLLM-Omni does not reject configurations outside this table.** With batch invariance
+enabled, a different pipeline, resolution, dtype, step count or GPU count runs normally —
+the engine does not fail closed on any of them. Determinism then holds only for the
+operators vLLM actually replaces; anything outside that set (see
+[Known Limitations](#known-limitations)) carries no guarantee.
+
+So read the table as *measured*, not as *supported*: entries outside it are **unverified,
+not unsupported**. They may well be batch-invariant — nobody has checked. If you validate
+another configuration, please report it so the table can grow.
+
+This matches vLLM's own approach upstream, which likewise lists the models it has
+explicitly validated and notes that others may also work.
+
+`num_inference_steps` is worth calling out because it is the one dimension we can reason
+about rather than merely leave unmeasured: it is a loop count and changes no tensor shape,
+so extra steps cannot break the per-step invariance the kernels provide. Only 8 steps have
+been measured, but unlike resolution it carries no shape risk.
+
+### Multi-GPU is unverified in both directions
+
+Every measurement above is single-GPU, and so is every parallelism degree behind it: all
+12 degrees in `DiffusionParallelConfig` were at 1 for the whole evidence matrix. Multi-GPU
+diffusion batch invariance is therefore **unverified in both directions** — there is no
+evidence that it holds, and none that it fails. It is not gated, so it runs.
+
+The single-GPU evidence says nothing about the multi-GPU path, and that is a structural gap
+rather than a sampling one: on one GPU the diffusion stage performs **no collective
+communication at all**. Every `world_size` product in `DiffusionParallelConfig` collapses
+to 1, and at `world_size == 1` `GroupCoordinator.all_reduce` returns its input untouched.
+Reduction order — the usual source of batch-dependent numerics in collectives — cannot
+vary because there is no reduction. So the single-GPU runs never exercise the code whose
+determinism multi-GPU determinism would rest on.
 
 ### Why only SD3
 
@@ -172,25 +207,9 @@ operator-coverage decision, not a preference for SD3:
 Lifting the pipeline gate therefore waits on upstream batch-invariant convolution and
 attention kernels, not on more testing here.
 
-### Why the single-GPU gate is load-bearing
+### What multi-GPU would need audited
 
-`num_gpus must be 1` is not merely "multi-GPU is untested". It is the check that keeps the
-whole parallelism surface out of scope:
-
-- `DiffusionParallelConfig` exposes 12 parallelism degrees. The gate requires only two of
-  them explicitly (`vae_patch_parallel_size == 1`, `use_hsdp == False`); the remaining ten
-  are held at 1 indirectly, because `__post_init__` derives `world_size` from the product
-  of `pipeline_parallel_size`, `data_parallel_size`, `tensor_parallel_size`,
-  `ulysses_degree`, `ring_degree` and `cfg_parallel_size`, and a single GPU forces that
-  product to 1. `vae_patch_parallel_size` and `enable_expert_parallel` are not in that
-  product — the former is why it carries its own `require`, and the latter is harmless
-  today because its degree is `tp × dp` (both 1 on one GPU) and SD3 is not an MoE model.
-- With `world_size == 1`, `GroupCoordinator.all_reduce` returns its input immediately, so
-  the diffusion stage issues no collective communication at all. Reduction order — the
-  usual source of batch-dependent numerics in collectives — cannot vary because there is
-  no reduction.
-
-There is also an omni-specific gap waiting on the other side of that gate. vLLM sets
+There is an omni-specific gap to check before trusting the multi-GPU path. vLLM sets
 `disable_custom_all_reduce = True` whenever `VLLM_BATCH_INVARIANT` is on, in
 `vllm/config/parallel.py`. `disable_custom_all_reduce` appears zero times anywhere in
 `vllm_omni`, and diffusion calls `torch.distributed.all_reduce` directly rather than
@@ -237,9 +256,7 @@ Closing the gap requires batch-invariant implementations of those three operator
 vLLM, which is upstream work. Until then:
 
 - only the configuration in [Tested Configurations](#tested-configurations) has evidence,
-  and the engine rejects the rest while batch invariance is on — except the step count,
-  which is not gated because it carries no shape, so step counts other than 8 run
-  unverified;
+  and the rest runs unverified rather than being rejected;
 - multi-GPU diffusion batch invariance is unverified; the evidence matrix is single-GPU;
 - `torch.compile` paths are unverified — the validated run uses `enforce_eager=True`;
 - image output beyond `output_type="latent"`/`"pt"` adds a VAE decode and PIL encode step
@@ -247,14 +264,13 @@ vLLM, which is upstream work. Until then:
 
 ### AudioX is mutually exclusive with the seed contract
 
-`AudioXPipeline` cannot run under batch invariance at all, for a reason independent of the
-capability gate. The [seed contract](#seed-contract) rejects any request carrying a
-`generator` object, while `pipeline_audiox.py` raises
+`AudioXPipeline` cannot run under batch invariance at all — the one configuration that is
+genuinely blocked rather than merely unverified. The [seed contract](#seed-contract)
+rejects any request carrying a `generator` object, while `pipeline_audiox.py` raises
 `"AudioXPipeline requires sampling_params.generator."` when `generator is None`. Every
 request is rejected by one side or the other.
 
 The seed contract does not branch on pipeline: it applies to every request whose stage is
-of type `diffusion`. This costs nothing today, because the capability gate refuses AudioX
-before the contract is reached — but it is the first thing to resolve when audio pipelines
-are opened up, and the fix belongs on AudioX's `generator` requirement rather than on the
-contract.
+of type `diffusion`. So an AudioX request under batch invariance fails either way; turn
+batch invariance off for that stage (`VLLM_OMNI_DIFFUSION_BATCH_INVARIANT=0`) to run it.
+The fix belongs on AudioX's `generator` requirement rather than on the contract.
