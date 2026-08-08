@@ -185,12 +185,28 @@ def test_worker_bootstrap_skips_rocm_cuda_device_silently(
     assert caplog.records == []
 
 
-def test_worker_bootstrap_rejects_below_sm80_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (7, 5))
+@pytest.mark.parametrize("capability", [(7, 5), (12, 0)])
+def test_worker_bootstrap_admits_unvalidated_cuda_capability(
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+    capability: tuple[int, int],
+) -> None:
+    """Unmeasured capability is unverified, not unsupported: run, do not raise.
 
-    with pytest.raises(RuntimeError, match=">= 8.0"):
-        diffusion_worker_module._initialize_batch_invariance(torch.device("cuda", 0))
+    The capabilities here sit below and above the measured 8.9, so re-adding a
+    bound in either direction fails this test rather than surfacing as a
+    startup crash on a user's GPU. Determinism on such a device is scoped by
+    docs/features/batch_invariance.md, not by a gate.
+    """
+    from vllm.model_executor.layers import batch_invariant
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
+    init_batch_invariance = mocker.patch.object(batch_invariant, "init_batch_invariance")
+
+    diffusion_worker_module._initialize_batch_invariance(torch.device("cuda", 0))
+
+    init_batch_invariance.assert_called_once_with()
 
 
 def test_worker_bootstrap_calls_native_vllm_on_supported_cuda(
