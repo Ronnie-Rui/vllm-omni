@@ -145,11 +145,11 @@ produced by running the engine with `max_num_seqs=4` so a partial wave forms nat
 (the batch-size-to-capacity mapping is `{1: 1, 2: 2, 3: 4, 4: 4}`); reproducing BS3 with
 `max_num_seqs=3` exercises a different admission path.
 
-Reproduce with:
-
-```bash
-python examples/offline_inference/text_to_image/sd3_batch_invariance_gpu.py
-```
+The GPU harness that collected this evidence is not part of this PR; it is submitted
+separately so that this change stays reviewable as a seed-contract change. Until it lands,
+reproduce the measurement by running `StableDiffusion3Pipeline` under the engine settings
+above with `VLLM_OMNI_DIFFUSION_BATCH_INVARIANT=1`, and compare the latents of the same
+seeded prompt across batch sizes 1, 2, 3 and 4.
 
 ### The table is evidence, not a gate
 
