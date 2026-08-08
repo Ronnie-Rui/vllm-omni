@@ -5,14 +5,15 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib.util
 import json
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from examples.offline_inference.text_to_image import sd3_batch_invariance_gpu as gpu_evidence
-from examples.offline_inference.text_to_image.sd3_batch_invariance_gpu import _assign_repetitions_to_gpus
 from tests.diffusion.batch_invariance_support import (
     CASES_BY_BATCH_SIZE,
     REQUESTS,
@@ -23,6 +24,34 @@ from tests.diffusion.batch_invariance_support import (
     tensor_metadata,
     validate_case_evidence,
 )
+
+# ``examples/`` has no ``__init__.py``, so it is only importable as a namespace
+# package. Once ``tests/examples/offline_inference/__init__.py`` puts a regular
+# ``examples.offline_inference`` on the path (any full-suite collection does),
+# it shadows the namespace portion and ``examples.offline_inference.text_to_image``
+# disappears. Load the evidence script by path instead, like the other tests that
+# cover example scripts do.
+_GPU_EVIDENCE_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "examples"
+    / "offline_inference"
+    / "text_to_image"
+    / "sd3_batch_invariance_gpu.py"
+)
+_GPU_EVIDENCE_MODULE_NAME = "sd3_batch_invariance_gpu_evidence_test"
+
+
+def _load_gpu_evidence():
+    spec = importlib.util.spec_from_file_location(_GPU_EVIDENCE_MODULE_NAME, _GPU_EVIDENCE_PATH)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_GPU_EVIDENCE_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+gpu_evidence = _load_gpu_evidence()
+_assign_repetitions_to_gpus = gpu_evidence._assign_repetitions_to_gpus
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
