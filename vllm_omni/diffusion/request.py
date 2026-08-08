@@ -6,7 +6,7 @@ import random
 from dataclasses import dataclass, field
 from typing import Any
 
-from vllm_omni.diffusion.batch_invariance import validate_batch_invariant_diffusion_seed
+from vllm_omni.diffusion.batch_invariance import validate_batch_invariant_diffusion_request
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 DUMMY_DIFFUSION_REQUEST_ID = "dummy_req_id"
@@ -40,11 +40,12 @@ class OmniDiffusionRequest:
 
         self.seed_was_explicit = self.sampling_params.seed is not None
 
-        # Must run before the fallback below, which would otherwise hide a missing
-        # seed behind a random one. Internal warmup requests are exempt: they are
-        # constructed by the engine itself and legitimately rely on that fallback.
+        # Must run after seed_was_explicit above, which it reads, and before the
+        # fallback below, which would otherwise hide a missing seed behind a random
+        # one. Internal warmup requests are exempt: they are constructed by the
+        # engine itself and legitimately rely on that fallback.
         if not self.is_dummy_run():
-            validate_batch_invariant_diffusion_seed(self.sampling_params, request_id=self.request_id)
+            validate_batch_invariant_diffusion_request(self)
 
         # When neither a generator nor a seed is provided, assign a random seed
         # so that all ranks derive the same generator state.

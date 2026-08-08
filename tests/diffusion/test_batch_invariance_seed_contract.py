@@ -15,8 +15,10 @@ from vllm_omni.diffusion.batch_invariance import (
     MAX_TORCH_MANUAL_SEED,
     MIN_TORCH_MANUAL_SEED,
     diffusion_batch_invariant_enabled,
+    validate_batch_invariant_diffusion_request,
     validate_batch_invariant_diffusion_seed,
 )
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker import diffusion_worker as diffusion_worker_module
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -147,6 +149,70 @@ def test_seed_contract_follows_the_diffusion_switch_not_the_global_one(monkeypat
         OmniDiffusionSamplingParams(),
         request_id="request-test",
     )
+
+
+def _request(**params) -> OmniDiffusionRequest:
+    return OmniDiffusionRequest(
+        prompt={"prompt": "a cup of coffee on a table"},
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1, **params),
+        request_id="request-test",
+    )
+
+
+def test_request_gate_rejects_implicit_seed(monkeypatch):
+    """seed_was_explicit is the one check the seed validator alone cannot make."""
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+
+    with pytest.raises(ValueError, match="seed"):
+        _request()
+
+
+def test_request_gate_rejects_generator_device(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+
+    with pytest.raises(ValueError, match="generator_device"):
+        _request(seed=1234, generator_device="cpu")
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [("latents", torch.zeros(1)), ("sigmas", [1.0, 0.5])],
+)
+def test_request_gate_rejects_externally_supplied_rng_inputs(monkeypatch, field_name, value):
+    """These bypass the seed: latents replace the initial noise, sigmas the schedule."""
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+
+    with pytest.raises(ValueError, match=field_name):
+        _request(seed=1234, **{field_name: value})
+
+
+def test_request_gate_accepts_configurations_outside_the_evidence_table(monkeypatch):
+    """Off-table recipes run rather than being rejected.
+
+    Batch invariance is documented, not enforced: determinism holds for the operators
+    vLLM replaces, and everything else is unverified rather than unsupported. This
+    pins that behaviour so the configuration gate cannot be reintroduced silently.
+    """
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+
+    request = _request(
+        seed=1234,
+        height=1024,
+        width=768,
+        num_outputs_per_prompt=2,
+        max_sequence_length=512,
+        guidance_scale=7.5,
+        output_type="pil",
+    )
+
+    assert request.seed_was_explicit is True
+    assert request.sampling_params.height == 1024
+
+
+def test_request_gate_is_a_noop_when_batch_invariance_is_disabled(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+
+    validate_batch_invariant_diffusion_request(_request(generator_device="cpu", sigmas=[1.0]))
 
 
 def test_worker_bootstrap_is_noop_when_batch_invariance_is_disabled(
