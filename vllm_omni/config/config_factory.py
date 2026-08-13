@@ -416,6 +416,10 @@ class StageConfigFactory:
             validate_async_chunk_timeout_s(timeout_s, source="--async-chunk-timeout-s")
             deploy_cfg.async_chunk_timeout_s = timeout_s
 
+        from vllm_omni.utils.forced_aligner import inject_forced_aligner_stage
+
+        pipeline_cfg, deploy_cfg = inject_forced_aligner_stage(pipeline_cfg, deploy_cfg, cli_overrides)
+
         stages = merge_pipeline_deploy(pipeline_cfg, deploy_cfg, cli_overrides)
 
         # Overlay declarative parallel strategies (opt-in) before CLI overrides.
