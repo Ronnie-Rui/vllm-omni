@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import nullcontext
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.distributed as dist
@@ -18,6 +18,13 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     DistributedVaeMixin,
     GridSpec,
     TileTask,
+)
+from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
+    can_encode_frames,
+    decode_frames,
+    encode_frames,
+    is_encoder_installed,
+    is_installed,
 )
 from vllm_omni.diffusion.models.interface import DecodedChunkConsumer
 from vllm_omni.platforms import current_omni_platform
@@ -46,6 +53,22 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
         with self._execution_context():
             return super().encode(x, return_dict=return_dict)
 
+    def _encode(self, x: torch.Tensor):
+        # Keep the parent's tiling dispatch and patchified tile coordinates.
+        # Only the untiled, supported inference schedule uses preallocation.
+        if not is_encoder_installed(self):
+            return super()._encode(x)
+        if can_encode_frames(self, x):
+            tiled = self.use_tiling and (
+                x.shape[-2] > self.tile_sample_min_height or x.shape[-1] > self.tile_sample_min_width
+            )
+            if not tiled:
+                return encode_frames(self, x)
+        try:
+            return super()._encode(x)
+        finally:
+            self.clear_cache()
+
     def decode(self, z: torch.Tensor, return_dict: bool = True):
         """Decode a Wan latent using the Diffusers-compatible full-tensor API."""
         with self._execution_context():
@@ -61,6 +84,10 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
             return self.tiled_decode(z, return_dict=return_dict)
 
         return self._decode_temporal(z, return_dict=return_dict)
+
+    # Chunks are published straight from the decoder, clamped to the
+    # checkpoint's output range.
+    chunk_value_range: ClassVar[tuple[float, float]] = (-1.0, 1.0)
 
     @apply_forward_hook
     def decode_with_chunks(self, z: torch.Tensor, *, on_chunk: DecodedChunkConsumer) -> None:
@@ -97,6 +124,15 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
         return_dict: bool = True,
     ):
         """Decode the non-tiled temporal path, optionally streaming chunks."""
+        if on_chunk is None and is_installed(self) and not torch.is_grad_enabled():
+            try:
+                out = decode_frames(self, z)
+            finally:
+                self.clear_cache()
+            if not return_dict:
+                return (out,)
+            return DecoderOutput(sample=out)
+
         self.clear_cache()
         callback_error: BaseException | None = None
         try:
@@ -181,6 +217,24 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
         model = super().from_pretrained(*args, **kwargs)
         model.init_distributed()
         return model
+
+    def retain_stage_components(self, *, encode: bool) -> None:
+        """Prune the unused Wan half before device placement/offload discovery.
+
+        Diffusers 0.40 caches encoder/decoder convolution counts separately;
+        both encode and decode call clear_cache, but neither executes the other
+        half. Keep the public attributes and zero only the removed cache count.
+        This reduces resident weights, NOT from_pretrained's peak host memory:
+        the ordinary checkpoint loader still loads both halves first.
+        """
+        removed = "decoder" if encode else "encoder"
+        projection = "post_quant_conv" if encode else "quant_conv"
+        if not isinstance(getattr(self, "_cached_conv_counts", None), dict):
+            raise RuntimeError("Wan stage VAE pruning requires Diffusers' cached encoder/decoder conv counts.")
+        setattr(self, removed, None)
+        setattr(self, projection, None)
+        self._cached_conv_counts[removed] = 0
+        self.clear_cache()
 
     def tile_split(self, z: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
         _, _, num_frames, height, width = z.shape
@@ -322,15 +376,16 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
     def encode_tile_exec(self, task: TileTask) -> torch.Tensor:
         """Encode a single sample tile into latent space."""
         self.clear_cache()
-        time = []
-        for k, tile in enumerate(task.tensor):
-            self._enc_conv_idx = [0]
-            encoded = self.encoder(tile, feat_cache=self._enc_feat_map, feat_idx=self._enc_conv_idx)
-            encoded = self.quant_conv(encoded)
-            time.append(encoded)
-        result = torch.cat(time, dim=2)
-        self.clear_cache()
-        return result
+        try:
+            time = []
+            for tile in task.tensor:
+                self._enc_conv_idx = [0]
+                encoded = self.encoder(tile, feat_cache=self._enc_feat_map, feat_idx=self._enc_conv_idx)
+                encoded = self.quant_conv(encoded)
+                time.append(encoded)
+            return torch.cat(time, dim=2)
+        finally:
+            self.clear_cache()
 
     def encode_tile_merge(
         self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec

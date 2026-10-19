@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Diffusion batch-invariance switch and the request-level seed contract."""
 
@@ -7,6 +7,7 @@ import os
 
 import vllm.envs as envs
 
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 MIN_TORCH_MANUAL_SEED = -(2**63)
@@ -48,19 +49,19 @@ def validate_batch_invariant_diffusion_seed(
         return
 
     if sampling_params.generator is not None:
-        raise ValueError(
+        raise OmniClientError(
             "Diffusion batch invariance requires one explicit integer seed and "
             f"does not accept generator input for diffusion request {request_id!r}."
         )
 
     seed = sampling_params.seed
     if isinstance(seed, bool) or not isinstance(seed, int):
-        raise ValueError(
+        raise OmniClientError(
             "Diffusion batch invariance requires an explicit integer seed for "
             f"diffusion request {request_id!r}; got {seed!r}."
         )
     if not MIN_TORCH_MANUAL_SEED <= seed <= MAX_TORCH_MANUAL_SEED:
-        raise ValueError(
+        raise OmniClientError(
             "Diffusion seed must be in the torch.Generator.manual_seed range "
             f"[{MIN_TORCH_MANUAL_SEED}, {MAX_TORCH_MANUAL_SEED}]; got {seed} "
             f"for request {request_id!r}."

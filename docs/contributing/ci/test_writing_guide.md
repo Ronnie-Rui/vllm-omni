@@ -48,12 +48,14 @@ Defined in `pyproject.toml`:
 | `MI325`            | Tests that require MI325 GPU (AMD/ROCm) *                                                               |
 | `A2`               | Tests that require A2 NPU *                                                                             |
 | `A3`               | Tests that require A3 NPU *                                                                             |
+| `A5`               | Tests that require A5 NPU *                                                                             |
+| `310P`             | Tests that require 310P NPU *                                                                           |
 | `cards_{n}`        | Tests that require *n* accelerator cards (`cards_1` … `cards_8`); auto-added from `num_cards` *         |
 | `slow`             | Slow tests (may skip in quick CI)                                                                       |
 | `benchmark`        | Benchmark tests (decorator on runner test functions; perf JSON uses `full_model` + type marker instead) |
 | `local_model`      | Tests requiring local / non-HF-hub model weights                                                        |
 
-\* Means those markers are auto-added by `@hardware_test` (parametrization decorator) or `hardware_marks` (only returning the list of marks for flexibility). Do **not** write `pytest.mark.H100` / `pytest.mark.L4` (or other SKU names) by hand: `check-mark` rejects that so `cards_{n}` cannot be skipped.
+\* Means those markers are auto-added by `@hardware_test` (parametrization decorator) or `hardware_marks` (only returning the list of marks for flexibility). Do **not** write `[hardware-platform]` marks other than `cpu` (`pytest.mark.gpu`, `pytest.mark.cuda`, `pytest.mark.rocm`, `pytest.mark.xpu`, `pytest.mark.npu`, `pytest.mark.musa`) or SKU names (`pytest.mark.H100`, `pytest.mark.L4`, …) by hand. `check-mark` rejects those so they go through `hardware_test` / `hardware_marks` and a SKU plus `cards_{n}` cannot be skipped. `pytest.mark.cpu` stays direct because CPU has no SKU.
 
 #### Example usage for markers
 
@@ -76,7 +78,7 @@ def test_video_to_audio()
 This decorator is intended to make hardware-aware, cross-platform test authoring easier and more robust for CI/CD environments. The `hardware_test` decorator in `vllm-omni/tests/helpers/mark.py` performs the following actions:
 
 1. **Applies platform and resource markers**  
-   Adds the appropriate pytest markers for each specified hardware platform (e.g., `cuda`, `rocm`, `xpu`, `npu`) and resource type (e.g., `L4`, `H100`, `H200`, `B200`, `MI325`, `B60`, `A2`, `A3`).
+   Adds the appropriate pytest markers for each specified hardware platform (e.g., `cuda`, `rocm`, `xpu`, `npu`) and resource type (e.g., `L4`, `H100`, `H200`, `B200`, `MI325`, `B60`, `A2`, `A3`, `A5`, `310P`). The helper emits these marks; test files do not write them:
    ```python
    @pytest.mark.cuda
    @pytest.mark.L4
@@ -89,7 +91,7 @@ This decorator is intended to make hardware-aware, cross-platform test authoring
    Accepts `num_cards` as either a single integer for all platforms or as a dictionary with per-platform values. If not specified, defaults to 1 card per platform.
 
 4. **Integrates resource validation**  
-   On CUDA and XPU, when `num_cards > 1`, attaches pytest's built-in `skipif` if the machine has fewer devices than requested. This is not a named `skipif_*` marker and is not used for `-m` filtering.
+   On the active CUDA, ROCm, XPU, NPU or MUSA platform, when `num_cards > 1`, attaches pytest's built-in `skipif` if the machine has fewer visible devices than requested. Single-card marks and marks for other platforms do not query device counts. This is not a named `skipif_*` marker and is not used for `-m` filtering.
 
 5. **Works with pytest filtering**  
    Allows tests to be filtered and selected at runtime using standard pytest marker expressions (e.g., `-m "H100 and cards_2"`, `-m "L4 and not cards_1"`).
@@ -157,7 +159,8 @@ When `mark` is present, it must be an **array** with exactly one ``hardware_mark
 }
 ```
 
-- Local bulk load: `pytest -sv tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "full_model and diffusion and H100"`
+- Local bulk load: `pytest -sv tests/dfx/perf/scripts/run_benchmark.py -m "full_model and H100"` (omni/TTS and `/v1/images/*` + `/v1/videos` diffusion)
+- Diffusion chat-completions remaining cases: `pytest -sv tests/dfx/perf/scripts/run_diffusion_benchmark.py -m "full_model and diffusion and H100"`
 - Nightly CI perf steps: `--test-config-file tests/dfx/perf/tests/test_<model>_vllm_omni.json` (file selects cases; no `-m`)
 - Result filenames use **runtime** GPU detection (`get_runtime_resource_label`); `H100` is omitted on the default CI pool
 
@@ -180,7 +183,7 @@ If you want to add support for a new platform (e.g., "tpu" for a new accelerator
        "cards_2: [hardware-cards] Tests that require 2 accelerator cards",
    ]
    ```
-   `check-mark` treats `[hardware-platform]` names (including `cpu`/`gpu`) as allowed `pytest.mark.<name>` values. `hardware_test(res=...)` still rejects `cpu`/`gpu` as `res` keys.
+   `check-mark` rejects every `[hardware-platform]` mark except `cpu`. Write `gpu` / `cuda` / `rocm` / `xpu` / `npu` / `musa` (and any new accelerator platform added here) through `hardware_test` / `hardware_marks` so the platform, a `[hardware-resource]` SKU, and `cards_{n}` are attached. `pytest.mark.cpu` stays direct because `cpu` has no SKU. `hardware_test(res=...)` rejects `cpu` and `gpu` as `res` keys; `gpu` is auto-added for platforms tagged `[gpu]`.
 2. **Implement a marker construction function for your platform** in `vllm-omni/tests/helpers/mark.py`:
    ```python
    # In vllm-omni/tests/helpers/mark.py
@@ -217,6 +220,36 @@ If you want to add support for a new platform (e.g., "tpu" for a new accelerator
 See code in `vllm-omni/tests/helpers/mark.py` for existing examples (`_cuda_marks`, `_rocm_marks`, `_npu_marks`).
 
 ## Test case style
+
+### Runtime fixtures
+
+Live engines start through the shared fixtures in `tests/helpers/fixtures/runtime.py`, never by hand. Each fixture takes `omni_fixture_lock`, keeps the Whisper judge off the accelerator around the engine, and runs `cleanup_test_environment` before start and after shutdown, including when construction fails after workers were already spawned.
+
+| Fixture | Scope | Engine | Parametrize with (`indirect=True`) |
+| :--- | :--- | :--- | :--- |
+| `omni_server` / `omni_server_function` | module / function | `vllm_omni serve` subprocess | `OmniServerParams` |
+| `omni_runner` / `omni_runner_function` | module / function | in-process `Omni` (`OmniRunner`) | `(model, stage_config_path[, extra_omni_kwargs])` |
+| `async_omni_runner` / `async_omni_runner_function` | module / function | in-process `AsyncOmni` (`AsyncOmniRunner`) | `AsyncOmniParams` |
+
+For `AsyncOmni` the function-scoped `async_omni_runner_function` is the default, the opposite of the two pairs above. `AsyncOmni.__init__` is synchronous, but its coroutine methods bind to the event loop of their first call, and pytest-asyncio's default loop scope is `function`: an engine shared across tests hangs on the second `generate()`. Use the module-scoped `async_omni_runner` only when every consumer in the module is marked `@pytest.mark.asyncio(loop_scope="module")`. Both are async fixtures, so the engine is built and shut down on the running loop of the test (or module); request them from `async def` tests. Do not construct `AsyncOmni(...)` directly in a live test or wrap it in `ExitStack` / `try/finally`; L1 tests that build the object with `object.__new__` or a fake engine are unaffected.
+
+```python
+from tests.helpers.runtime import AsyncOmniParams
+
+_PARAMS = [AsyncOmniParams(model="tiny-random/Qwen-Image", extra_omni_kwargs={"enforce_eager": True})]
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_omni_runner_function", _PARAMS, indirect=True)
+async def test_generate_once(async_omni_runner_function) -> None:
+    engine = async_omni_runner_function.engine
+    async for output in engine.generate("a white cat", request_id="req-1"):
+        assert output.request_id == "req-1"
+```
+
+On teardown both runners close the engine, stop the engine workers they own that survived it, then run `cleanup_test_environment`. A runner owns the workers that appeared while its engine was starting and their descendants (recorded while the engine is alive, because daemon diffusion workers are reparented once `StageDiffusionProc` is joined); workers that belong to another runner are left alone. At `--run-level core_model` the deploy YAML is patched to `load_format: dummy` and `diffusion`-marked tests get the tiny-model rewrite, exactly as with `omni_runner`.
 
 ### L1 & L2 Level Testing - Unit Testing and Basic End-to-End Verification
 
@@ -553,7 +586,7 @@ L5 level testing focuses on the performance of model services under ***long-runn
 
 - ***Trigger Timing***: **`Weekly`** (weekly) or **`Days before Release`** (several days before a major release). Due to long execution times, the frequency is lower.
 - ***Run Command***:
-    - ***Stability***: `pytest -s -v tests/dfx/stability/scripts/test_stability_qwen3_omni.py` or `pytest -s -v tests/dfx/stability/scripts/test_stability_wan22.py` (or add `test_stability_<model>.py` alongside a matching JSON config)
+    - ***Stability***: `pytest -s -v tests/dfx/stability/scripts/run_stability_qwen3_omni.py` or `pytest -s -v tests/dfx/stability/scripts/run_stability_wan22.py` (or add `run_stability_<model>.py` alongside a matching JSON config)
     - ***Reliability***: `pytest -s -v tests/dfx/reliability/test_reliability_<model>.py -m slow` (current suites: `qwen3_omni`, `wan22`, `hunyuan_image`).
 - ***Script Example***:
 
@@ -562,7 +595,7 @@ L5 level testing focuses on the performance of model services under ***long-runn
 
 ##### Stability
 
-When you want to add L5-level stability test cases, add or extend the appropriate JSON file under `tests/dfx/stability/tests/` (for example `test_qwen3_omni.json` for Omni bench traffic, or `test_wan22.json` for diffusion `/v1/videos` workloads). Pair the JSON with `tests/dfx/stability/scripts/test_stability_<model>.py`. The following illustrates the Qwen3-Omni shape:
+When you want to add L5-level stability test cases, add or extend the appropriate JSON file under `tests/dfx/stability/tests/` (for example `test_qwen3_omni.json` for Omni bench traffic, or `test_wan22.json` for diffusion `/v1/videos` workloads). Pair the JSON with `tests/dfx/stability/scripts/run_stability_<model>.py`. The following illustrates the Qwen3-Omni shape:
 
 ```json
 {
@@ -634,9 +667,9 @@ Add pytest modules under `tests/dfx/reliability/` (for example `test_reliability
 
 ###### Parametrization and markers
 
-- Each test module defines a **`RELIABILITY_SCENARIOS`** list (`test_name`, `server_params`: model, `stage_config_name` or diffusion `server_args`, etc.). **`create_reliability_omni_server_params()`** in `tests/dfx/conftest.py` resolves stage paths (including XPU substitutions where applicable) and builds **`OmniServerParams`** lists consumed by **`@pytest.mark.parametrize(..., indirect=True)`** on `omni_server` or `omni_server_function`.
-- Cases are tagged **`@pytest.mark.slow`** for weekly / selective CI. GPU-heavy suites use **`@hardware_test(res={"cuda": "H100"}, num_cards=...)`** (Qwen3-Omni **2**× H100; Wan2.2 **1**× H100; HunyuanImage DiT **4**× H100).
-- **Process-kill** tests use **`@pytest.mark.skipif(os.name == "nt", ...)`** because injection uses POSIX **`pgrep` / `kill`**.
+- Each test module defines a **`RELIABILITY_SCENARIOS`** list (`test_name`, `server_params`: model, `stage_config_name` or diffusion `server_args`, etc.). **`create_reliability_omni_server_params()`** in `tests/dfx/conftest.py` resolves stage paths and builds **`OmniServerParams`** lists consumed by **`@pytest.mark.parametrize(..., indirect=True)`** on `omni_server` or `omni_server_function`.
+- Cases are tagged **`@pytest.mark.slow`** for weekly / selective CI. GPU-heavy suites use **`@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=...)`** (Qwen3-Omni **2** cards; Wan2.2 **1** card; HunyuanImage DiT **4** cards).
+- **Process-kill** tests use POSIX **`pgrep` / `kill`**. The helper raises on Windows instead of skipping.
 
 ###### Adding a new model suite
 
