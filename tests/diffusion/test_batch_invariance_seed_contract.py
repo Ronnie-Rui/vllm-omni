@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import logging
 import os
@@ -172,15 +172,11 @@ def _request(**params) -> OmniDiffusionRequest:
 
 
 def test_request_gate_rejects_implicit_seed(monkeypatch):
-    """Construction must fail before __post_init__ hides the gap behind a random seed.
-
-    The raise observed here comes from the seed validator, which runs first; the
-    seed_was_explicit check is covered separately below.
-    """
+    """External admission rejects a missing seed before model preprocessing."""
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
 
     with pytest.raises(ValueError, match="requires an explicit integer seed"):
-        _request()
+        validate_batch_invariant_diffusion_request(_request())
 
 
 def test_request_gate_rejects_a_seed_the_fallback_supplied(monkeypatch):
@@ -205,7 +201,7 @@ def test_request_gate_rejects_generator_device(monkeypatch):
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
 
     with pytest.raises(ValueError, match="generator_device"):
-        _request(seed=1234, generator_device="cpu")
+        validate_batch_invariant_diffusion_request(_request(seed=1234, generator_device="cpu"))
 
 
 @pytest.mark.parametrize(
@@ -217,7 +213,7 @@ def test_request_gate_rejects_externally_supplied_rng_inputs(monkeypatch, field_
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
 
     with pytest.raises(ValueError, match=field_name):
-        _request(seed=1234, **{field_name: value})
+        validate_batch_invariant_diffusion_request(_request(seed=1234, **{field_name: value}))
 
 
 def test_request_gate_accepts_configurations_outside_the_evidence_table(monkeypatch):
@@ -241,6 +237,7 @@ def test_request_gate_accepts_configurations_outside_the_evidence_table(monkeypa
 
     assert request.seed_was_explicit is True
     assert request.sampling_params.height == 1024
+    validate_batch_invariant_diffusion_request(request)
 
 
 def test_request_gate_is_a_noop_when_batch_invariance_is_disabled(monkeypatch):
@@ -289,7 +286,7 @@ def test_worker_bootstrap_admits_every_cuda_capability(
     rather than surfacing as a startup crash on a user's GPU. Determinism on such a
     device is scoped by docs/features/batch_invariance.md, not by a gate.
     """
-    from vllm.model_executor.layers import batch_invariant
+    from vllm.model_executor.determinism import batch_invariant
 
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
@@ -309,7 +306,7 @@ def test_worker_bootstrap_aligns_native_env_for_diffusion_only_switch(
     init_batch_invariance() opens with ``if envs.VLLM_BATCH_INVARIANT``, so without
     the alignment every gate passes and the op replacement is a silent no-op.
     """
-    from vllm.model_executor.layers import batch_invariant
+    from vllm.model_executor.determinism import batch_invariant
 
     monkeypatch.setenv(DIFFUSION_BATCH_INVARIANT_ENV, "1")
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")

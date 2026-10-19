@@ -8,7 +8,7 @@ import random
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from vllm_omni.diffusion.batch_invariance import validate_batch_invariant_diffusion_request
+from vllm_omni.diffusion.batch_invariance import diffusion_batch_invariant_enabled
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 if TYPE_CHECKING:
@@ -56,6 +56,7 @@ class OmniDiffusionRequest:
     sampling_params: OmniDiffusionSamplingParams
     request_id: str
     kv_sender_info: dict[str, Any] | None = None
+    payload_sender_info: dict[str, Any] | None = None
     seed_was_explicit: bool = field(init=False, repr=False)
     # Optional opaque, model-owned input prepared before Scheduler admission.
     # Model code validates its concrete type when consuming it on the Worker.
@@ -72,14 +73,21 @@ class OmniDiffusionRequest:
     # Opaque native vLLM connector parameters. The Orchestrator and Scheduler
     # transport this bag without interpreting local pages or block IDs.
     kv_transfer_params: dict[str, Any] | None = None
+    # Worker-populated scheduler reuse boundaries, available before encoding.
+    kv_computed_tokens: tuple[int, ...] = ()
     # A model preprocessor may keep selected requests on the legacy full-forward
     # path even when the engine is globally configured for step execution.
     use_step_execution: bool = True
+    # Whether first and later denoising steps may share a step batch.
+    allow_mixed_step_phases: bool = True
     # KV-recv wall-clock (ms), set by the runner's _prepare_request_for_forward
     # and carried to DiffusionOutput for the vllm_omni:diffusion_kv_load_s metric.
     kv_recv_ms: float = 0.0
     # Time spent waiting for initial admission by the diffusion scheduler.
     scheduler_queue_wait_ms: float | None = None
+    # Engine-owned shared-memory signal for cooperative full-forward workers.
+    # Only the engine creates/unlinks it; workers attach readers until return.
+    cancellation_signal: str | None = field(default=None, repr=False)
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""
@@ -88,16 +96,14 @@ class OmniDiffusionRequest:
 
         self.seed_was_explicit = self.sampling_params.seed is not None
 
-        # Must run after seed_was_explicit above, which it reads, and before the
-        # fallback below, which would otherwise hide a missing seed behind a random
-        # one. Internal warmup requests are exempt: they are constructed by the
-        # engine itself and legitimately rely on that fallback.
-        if not self.is_dummy_run():
-            validate_batch_invariant_diffusion_request(self)
-
         # When neither a generator nor a seed is provided, assign a random seed
-        # so that all ranks derive the same generator state.
-        if self.sampling_params.generator is None and self.sampling_params.seed is None:
+        # so that all ranks derive the same generator state. BIC leaves missing
+        # seeds unset so rejected requests cannot seed reused params.
+        if (
+            self.sampling_params.generator is None
+            and self.sampling_params.seed is None
+            and (self.is_dummy_run() or not diffusion_batch_invariant_enabled())
+        ):
             self.sampling_params.seed = random.randint(0, 2**31 - 1)
 
         # Detect whether the caller explicitly provided guidance_scale before

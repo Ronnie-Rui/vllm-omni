@@ -1,7 +1,7 @@
 # Batch Invariance (Diffusion)
 
 !!! note
-    Diffusion batch invariance is experimental. Evidence covers a single Stable Diffusion 3 configuration on one GPU. Other configurations are **not rejected** — they run, just without that evidence. See [Known Limitations](#known-limitations) for the operator gaps behind that narrow scope.
+    Diffusion batch invariance is experimental. Historical SD3 results do not validate this revision; remeasure with the final code and vLLM versions. Other configurations are **not rejected** — they run, just without that evidence. See [Known Limitations](#known-limitations) for the operator gaps behind that narrow scope.
 
 Batch invariance means a request produces bit-identical output regardless of the batch size it lands in or the position it occupies inside that batch. vLLM-Omni builds on vLLM's batch-invariant kernels; for the autoregressive side see vLLM's own guide, this page covers the diffusion stage.
 
@@ -69,11 +69,11 @@ Three further inputs are rejected for the same reason — each takes the RNG ide
 | `latents` | supplies the initial noise directly, so the seed does not determine it at all |
 | `sigmas` | replaces the noise schedule, so the seeded trajectory follows a different path |
 
-These are the *only* request-level rejections in batch-invariant mode. They are not recipe constraints — they are the premise of "same seed ⇒ same output" itself, which is why they stay while the configuration checks do not (see [The table is evidence, not a gate](#the-table-is-evidence-not-a-gate)). The check runs from `OmniDiffusionRequest.__post_init__`, so it covers every construction path; internal warmup requests are exempt.
+These are the *only* request-level rejections in batch-invariant mode. They are not recipe constraints — they are the premise of "same seed ⇒ same output" itself, which is why they stay while the configuration checks do not (see [The table is evidence, not a gate](#the-table-is-evidence-not-a-gate)). External RNG inputs are checked before replica selection and model preprocessing; internal reconstruction and warmup are exempt. OpenPI checks seed provenance before forwarding, accepting configured defaults and validating provided types before coercion.
 
-## Tested Configurations
+## Historical PR Measurement Recipe
 
-This section records **what has been measured**, not what the engine permits:
+This historical recipe requires revalidation on the final code and vLLM versions:
 
 | Dimension | Validated value |
 | --- | --- |
@@ -83,9 +83,9 @@ This section records **what has been measured**, not what the engine permits:
 | Inference steps | 8 (the only measured value) |
 | dtype | `torch.bfloat16` |
 
-Engine settings used for that run: single GPU (`num_gpus=1`), `enforce_eager=True`, `output_type="latent"`, `vae_use_slicing=True`, no caching, no LoRA, no quantization, no CPU/layer-wise offload, no VAE patch parallelism, no step execution, no streaming.
+The historical [PR description](https://github.com/vllm-project/vllm-omni/pull/5935) compares eager, single-GPU SD3 at BS1 and BS4 using decoded bf16 image tensors of shape `[1, 3, 512, 512]`, not latents.
 
-Evidence was collected across batch sizes 1, 2, 3 and 4, repeated three times, with every comparison inside a repetition pinned to the same physical GPU. Batch size 3 comes from running with `max_num_seqs=4` so a partial wave forms naturally (the mapping is `{1: 1, 2: 2, 3: 4, 4: 4}`). To reproduce, run `StableDiffusion3Pipeline` under those settings with `VLLM_OMNI_DIFFUSION_BATCH_INVARIANT=1` and compare the latents of the same seeded prompt across batch sizes 1, 2, 3 and 4.
+Pending validation: repeat the same seeded prompt at real BS1–4 with `output_type="latent"`, including a feature-disabled control. Fix the physical GPU and code/vLLM versions; record sample positions, shapes, dtypes and byte hashes. These measurements have not been run.
 
 ### The table is evidence, not a gate
 
@@ -99,7 +99,7 @@ An omni-specific point needs auditing before trusting that path. vLLM sets `disa
 
 ### Why only SD3 has evidence
 
-`StableDiffusion3Pipeline` is the only pipeline a bit-identity run covers, and that follows from operator coverage rather than a preference for SD3. Video pipelines add `Conv3d` and audio pipelines add `Conv1d`; vLLM's batch-invariant layer overrides no convolution operator, so those paths are untouched by it. `group_norm` is a separate, image-side gap — also unoverridden upstream, and SD3 is exempt only because the recipe fixes the shapes its own normalization sees. Extending the evidence therefore waits on upstream batch-invariant convolution and attention kernels, not on more testing here.
+`StableDiffusion3Pipeline` is the only pipeline a bit-identity run covers, and that follows from operator coverage rather than a preference for SD3. Video pipelines add `Conv3d` and audio pipelines add `Conv1d`; vLLM's batch-invariant layer overrides no convolution operator, so those paths are untouched by it. `group_norm` is a separate, image-side gap — also unoverridden upstream, and SD3 is exempt only because the recipe fixes the shapes its own normalization sees. Uncovered operators require measurements of the actual pipeline.
 
 ## Implementation Details
 
@@ -114,17 +114,17 @@ Expect a throughput cost. Deterministic kernels give up optimizations that reord
 
 ## Known Limitations
 
-**The narrow tested configuration is a consequence of operator coverage, not of incomplete testing.** vLLM's batch-invariant layer overrides matrix multiplication (`mm`, `addmm`, `matmul`, `linear`, `bmm`), softmax variants and `mean.dim`. It does not override `scaled_dot_product_attention`, `conv2d`, or `group_norm` — exactly what a diffusion pipeline leans on: the `TORCH_SDPA` backend calls `torch.nn.functional.scaled_dot_product_attention` directly, and the VAE decoder is built from convolutions and group normalization. Their batch invariance is a property of the specific shapes the validated recipe produces, not something the kernel layer guarantees. Change the resolution and the convolution shapes change with it, which is why 512 × 512 is listed as measured rather than as a supported range.
+**Coverage and measurements limit the evidence.** vLLM's batch-invariant layer overrides matrix multiplication (`mm`, `addmm`, `matmul`, `linear`, `bmm`), softmax variants and `mean.dim`. It does not override `scaled_dot_product_attention`, `conv2d`, or `group_norm` — exactly what a diffusion pipeline leans on: the `TORCH_SDPA` backend calls `torch.nn.functional.scaled_dot_product_attention` directly, and the VAE decoder is built from convolutions and group normalization. Their batch invariance is a property of the specific shapes the validated recipe produces, not something the kernel layer guarantees. Change the resolution and the convolution shapes change with it, which is why 512 × 512 is listed as measured rather than as a supported range.
 
 An operator absent from the override list is not thereby non-deterministic — it is simply unguaranteed, and each case has to be argued separately rather than assumed either way.
 
-Closing the gap requires batch-invariant implementations of those three operators in vLLM, which is upstream work. Until then:
+Further operator guarantees and pipeline measurements are needed:
 
-- only the configuration in [Tested Configurations](#tested-configurations) has evidence, and the rest runs unverified rather than being rejected;
+- the [historical recipe](#historical-pr-measurement-recipe) needs revalidation; other configurations run unverified;
 - multi-GPU diffusion batch invariance is unverified; the evidence matrix is single-GPU;
 - `torch.compile` paths are unverified — the validated run uses `enforce_eager=True`;
-- image output beyond `output_type="latent"`/`"pt"` adds a VAE decode and PIL encode step that the evidence does not cover.
+- `output_type="latent"` skips VAE decode; `"pt"` includes decode, and PIL adds postprocessing/encoding. Evidence at one boundary does not validate another.
 
-### AudioX is mutually exclusive with the seed contract
+### Internal generators
 
-`AudioXPipeline` cannot run under batch invariance at all — the one configuration that is genuinely blocked rather than merely unverified. The [seed contract](#seed-contract) rejects any request carrying a `generator` object, while `pipeline_audiox.py` raises `"AudioXPipeline requires sampling_params.generator."` when `generator is None`, so every request is rejected by one side or the other. The contract does not branch on pipeline; turn batch invariance off for that stage (`VLLM_OMNI_DIFFUSION_BATCH_INVARIANT=0`) to run it. The fix belongs on AudioX's `generator` requirement rather than on the contract.
+The runner creates generators from admitted seeds. Pipeline request reconstruction must preserve this internal state.

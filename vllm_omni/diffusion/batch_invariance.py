@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Diffusion batch-invariance switch and seed contract."""
 
@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 import vllm.envs as envs
 
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 if TYPE_CHECKING:
@@ -52,62 +53,55 @@ def validate_batch_invariant_diffusion_seed(
         return
 
     if sampling_params.generator is not None:
-        raise ValueError(
+        raise OmniClientError(
             "Diffusion batch invariance requires one explicit integer seed and "
             f"does not accept generator input for diffusion request {request_id!r}."
         )
 
     seed = sampling_params.seed
     if isinstance(seed, bool) or not isinstance(seed, int):
-        raise ValueError(
+        raise OmniClientError(
             "Diffusion batch invariance requires an explicit integer seed for "
             f"diffusion request {request_id!r}; got {seed!r}."
         )
     if not MIN_TORCH_MANUAL_SEED <= seed <= MAX_TORCH_MANUAL_SEED:
-        raise ValueError(
+        raise OmniClientError(
             "Diffusion seed must be in the torch.Generator.manual_seed range "
             f"[{MIN_TORCH_MANUAL_SEED}, {MAX_TORCH_MANUAL_SEED}]; got {seed} "
             f"for request {request_id!r}."
         )
 
 
-def validate_batch_invariant_diffusion_request(request: "OmniDiffusionRequest") -> None:
-    """Require that the seed alone determines the RNG identity of a request.
-
-    Only the RNG identity is checked, not the recipe: batch invariance does not
-    reject configurations outside the validated tuple, it runs them (determinism
-    then holds for the operators vLLM actually replaces). The checks here are the
-    premise of "same seed => same output" itself, so they stay: caller-supplied
-    ``latents`` mean the seed no longer decides the initial noise, and
-    ``sigmas`` rewrite the schedule the seeded trajectory follows.
-    """
+def validate_batch_invariant_diffusion_params(
+    sampling_params: OmniDiffusionSamplingParams,
+    *,
+    request_id: str,
+) -> None:
+    """Validate external RNG inputs before selecting or binding a replica."""
     if not diffusion_batch_invariant_enabled():
         return
 
-    params = request.sampling_params
-    unsupported: list[str] = []
-
-    def require(condition: bool, message: str) -> None:
-        if not condition:
-            unsupported.append(message)
-
-    validate_batch_invariant_diffusion_seed(params, request_id=request.request_id)
-    # Not redundant with the seed check above: the request may already carry a seed
-    # that __post_init__ assigned as a fallback, which params alone cannot tell apart
-    # from a caller-supplied one. Vacuous when reached from __post_init__, which runs
-    # this before that fallback; load-bearing for callers that validate a request
-    # object built earlier, or built while the switch was off.
-    require(
-        request.seed_was_explicit,
-        "seed must be explicit when OmniDiffusionRequest is constructed",
-    )
-    require(params.generator_device is None, "generator_device must not be supplied")
-
-    for field_name in ("latents", "sigmas"):
-        require(getattr(params, field_name, None) is None, f"sampling_params.{field_name} must not be supplied")
+    validate_batch_invariant_diffusion_seed(sampling_params, request_id=request_id)
+    unsupported = [
+        field_name
+        for field_name in ("generator_device", "latents", "sigmas")
+        if getattr(sampling_params, field_name, None) is not None
+    ]
 
     if unsupported:
-        raise ValueError(
-            "Diffusion batch invariance requires the seed to determine the RNG identity. "
-            "Unsupported request: " + "; ".join(unsupported) + "."
+        raise OmniClientError(
+            "Diffusion batch invariance does not accept caller-supplied "
+            + ", ".join(unsupported)
+            + f" for diffusion request {request_id!r}."
+        )
+
+
+def validate_batch_invariant_diffusion_request(request: "OmniDiffusionRequest") -> None:
+    """Validate an external request before model preprocessing creates RNG state."""
+    if not diffusion_batch_invariant_enabled():
+        return
+    validate_batch_invariant_diffusion_params(request.sampling_params, request_id=request.request_id)
+    if not request.seed_was_explicit:
+        raise OmniClientError(
+            "Diffusion batch invariance: seed must be explicit when OmniDiffusionRequest is constructed."
         )
